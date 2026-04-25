@@ -561,6 +561,7 @@ async function train() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let eventsSincePaint = 0;
 
     while (true) {
       const { value, done } = await reader.read();
@@ -570,7 +571,13 @@ async function train() {
       buffer = lines.pop() || "";
       for (const line of lines) {
         if (line.trim()) {
-          handleTrainingEvent(JSON.parse(line));
+          const event = JSON.parse(line);
+          handleTrainingEvent(event);
+          eventsSincePaint += 1;
+          if (event.source === "seed" || event.bestPath?.length || eventsSincePaint >= 20) {
+            eventsSincePaint = 0;
+            await nextPaint();
+          }
         }
       }
     }
@@ -587,6 +594,10 @@ async function train() {
     elements.maxEpisodes.disabled = false;
     render();
   }
+}
+
+function nextPaint() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 function handleTrainingEvent(event) {
@@ -854,13 +865,15 @@ function drawTrials() {
   state.trials.forEach((trial, index) => {
     const age = (index + 1) / Math.max(1, state.trials.length);
     const score = (trial.reward - minReward) / Math.max(1, maxReward - minReward);
-    const alpha = 0.05 + age * 0.18 + score * 0.18;
+    const alpha = state.bestReached
+      ? 0.018 + age * 0.035 + score * 0.035
+      : 0.05 + age * 0.18 + score * 0.18;
     const color = trial.reached
-      ? `rgba(15, 157, 88, ${Math.min(0.66, alpha + 0.2)})`
+      ? `rgba(15, 157, 88, ${Math.min(state.bestReached ? 0.22 : 0.66, alpha + 0.2)})`
       : trial.collided
         ? `rgba(196, 79, 61, ${alpha})`
         : `rgba(92, 111, 136, ${alpha})`;
-    drawPath(trial.path, { color, width: 1.5 });
+    drawPath(trial.path, { color, width: state.bestReached ? 1 : 1.5 });
   });
 }
 
@@ -929,6 +942,8 @@ function resetTrainingView() {
   state.route = [];
   state.trials = [];
   state.bestPath = [];
+  state.bestReached = false;
+  state.bestParkingMode = null;
   state.currentPath = [];
   state.lidar = null;
   elements.progressBar.style.width = "0%";
