@@ -58,6 +58,8 @@ const state = {
   route: [],
   trials: [],
   bestPath: [],
+  bestReached: false,
+  bestParkingMode: null,
   currentPath: [],
   lidar: null,
   training: false
@@ -602,7 +604,7 @@ function handleTrainingEvent(event) {
       state.route = event.route;
     }
     state.currentPath = event.path || [];
-    if (event.path?.length) {
+    if (event.path?.length && event.source !== "seed") {
       state.trials.push({
         path: event.path,
         reward: event.reward,
@@ -615,13 +617,22 @@ function handleTrainingEvent(event) {
     }
     if (event.bestPath?.length) {
       state.bestPath = event.bestPath;
+      state.bestReached = Boolean(event.bestReached ?? event.reached);
+      state.bestParkingMode = event.bestParkingMode || event.parkingMode || state.bestParkingMode;
     }
-    state.lidar = event.lidar;
+    if (!state.bestReached || event.reached || event.bestPath?.length) {
+      state.lidar = event.lidar;
+    }
     elements.episodeText.textContent = `${event.episode} / ${event.total}`;
     elements.progressBar.style.width = `${Math.round(event.progress * 100)}%`;
     elements.rewardText.textContent = formatNumber(event.bestReward);
-    elements.distanceText.textContent = `${formatNumber(event.metrics.distance)} px`;
-    elements.clearanceText.textContent = `${formatNumber(event.metrics.clearance)} px`;
+    const displayedMetrics = event.bestMetrics || event.metrics;
+    elements.distanceText.textContent = `${formatNumber(displayedMetrics.distance)} px`;
+    elements.clearanceText.textContent = `${formatNumber(displayedMetrics.clearance)} px`;
+    if (event.source === "seed" && state.bestReached) {
+      const mode = state.bestParkingMode === "reverse" ? "back-in" : "forward-in";
+      setStatus(`Seeded solution (${mode})`);
+    }
     render();
     return;
   }
@@ -634,6 +645,8 @@ function handleTrainingEvent(event) {
   if (event.type === "done") {
     state.bestPath = event.bestPath || state.bestPath;
     state.route = event.route || state.route;
+    state.bestReached = Boolean(event.reached);
+    state.bestParkingMode = event.parkingMode || state.bestParkingMode;
     elements.progressBar.style.width = "100%";
     elements.rewardText.textContent = formatNumber(event.bestReward);
     elements.distanceText.textContent = `${formatNumber(event.distance)} px`;

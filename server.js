@@ -294,20 +294,28 @@ async function train(scene, send) {
     };
     send({
       type: "episode",
+      source: "seed",
       generation: 0,
       episode: 0,
       total,
       reward: round(expertResult.reward, 2),
       reached: expertResult.reached,
       collided: expertResult.collided,
+      bestReached: expertResult.reached,
       progress: 0,
       path: compressPath(expertResult.path),
       bestReward: round(expertResult.reward, 2),
       bestPath: compressPath(expertResult.path),
       route: expertResult.route,
       parkingMode: expertResult.parkingMode,
+      bestParkingMode: expertResult.parkingMode,
       lidar: expertResult.lidarSnapshot,
       metrics: {
+        distance: round(expertResult.finalDistance, 1),
+        clearance: round(expertResult.minClearance, 1),
+        steps: expertResult.steps
+      },
+      bestMetrics: {
         distance: round(expertResult.finalDistance, 1),
         clearance: round(expertResult.minClearance, 1),
         steps: expertResult.steps
@@ -336,23 +344,31 @@ async function train(scene, send) {
 
       send({
         type: "episode",
+        source: "rollout",
         generation,
         episode,
         total,
         reward: round(result.reward, 2),
         reached: result.reached,
         collided: result.collided,
+        bestReached: best.result.reached,
         progress: round(episode / total, 4),
         path: compressPath(result.path),
         bestReward: round(best.result.reward, 2),
         bestPath: improvedBest ? compressPath(best.result.path) : undefined,
         route: improvedBest ? best.result.route : undefined,
         parkingMode: result.parkingMode,
+        bestParkingMode: best.result.parkingMode,
         lidar: result.lidarSnapshot,
         metrics: {
           distance: round(result.finalDistance, 1),
           clearance: round(result.minClearance, 1),
           steps: result.steps
+        },
+        bestMetrics: {
+          distance: round(best.result.finalDistance, 1),
+          clearance: round(best.result.minClearance, 1),
+          steps: best.result.steps
         }
       });
 
