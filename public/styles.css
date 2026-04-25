@@ -191,6 +191,21 @@ canvas {
   font-weight: 700;
 }
 
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink);
+  font-size: 14px;
+  user-select: none;
+}
+
+.checkbox-field input {
+  width: 17px;
+  height: 17px;
+  accent-color: #16864f;
+}
+
 .obstacle-editor {
   border: 1px solid var(--line);
   border-radius: 8px;

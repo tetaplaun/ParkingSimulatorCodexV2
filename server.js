@@ -193,7 +193,8 @@ function normalizeScene(payload) {
     config: {
       generations: clampInt(payload.config?.generations, 6, 26, 13),
       population: clampInt(payload.config?.population, 8, 44, 22),
-      maxSteps: clampInt(payload.config?.maxSteps, 160, 520, 340)
+      maxSteps: clampInt(payload.config?.maxSteps, 160, 520, 340),
+      matchTargetHeading: payload.config?.matchTargetHeading !== false
     }
   };
 
@@ -355,6 +356,7 @@ function updateDistribution(mean, std, eliteVectors) {
 
 function simulate(scene, route, genes, rng, maxSteps) {
   const car = scene.car;
+  const matchHeading = scene.config.matchTargetHeading;
   let state = { ...scene.start, v: 0, delta: 0 };
   let waypointIndex = 0;
   let reward = 0;
@@ -364,7 +366,13 @@ function simulate(scene, route, genes, rng, maxSteps) {
   let closestDistance = distance(state, scene.target);
   const path = [{ x: state.x, y: state.y, theta: state.theta, delta: state.delta, v: state.v }];
   let lidarSnapshot = null;
-  const waypoints = offsetRoute(route.length ? route : [scene.start, scene.target], genes.sideOffset);
+  const baseRoute = route.length
+    ? route
+    : matchHeading
+      ? [pointFromState(scene.start), targetApproachPoint(scene), pointFromState(scene.target)]
+      : [pointFromState(scene.start), pointFromState(scene.target)];
+  const shiftedRoute = offsetRoute(baseRoute, genes.sideOffset);
+  const waypoints = matchHeading ? enforceTerminalWaypoints(shiftedRoute, scene) : shiftedRoute;
   const routeLength = estimateRouteLength(waypoints);
 
   for (let step = 0; step < maxSteps; step += 1) {
@@ -381,15 +389,22 @@ function simulate(scene, route, genes, rng, maxSteps) {
 
     const targetDistance = distance(state, scene.target);
     const targetHeading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
+    const targetProximity = clamp(1 - targetDistance / 120, 0, 1);
     const progressGain = closestDistance - targetDistance;
     closestDistance = Math.min(closestDistance, targetDistance);
 
     reward += progressGain * 16;
     reward -= targetDistance * 0.035;
+    if (matchHeading) {
+      reward -= targetHeading * targetProximity * 4.5;
+    }
     reward -= Math.abs(state.delta) * 0.55;
     reward -= Math.abs(state.delta - previousState.delta) * 1.25;
     reward -= Math.abs(action.throttle) * 0.08;
     reward -= Math.max(0, 58 - minLidar) * 0.32;
+    if (matchHeading) {
+      reward -= Math.max(0, Math.abs(state.v) - 10) * targetProximity * 0.12;
+    }
     reward -= Math.abs(state.v) > 8 ? 0.04 : 0.12;
     reward -= distanceToPolyline(state, waypoints) * 0.025;
 
@@ -403,23 +418,34 @@ function simulate(scene, route, genes, rng, maxSteps) {
       break;
     }
 
-    const insideTarget = targetDistance < 24 && targetHeading < 0.78;
+    const insideTarget = matchHeading
+      ? targetDistance < 18 && targetHeading < 0.2 && Math.abs(state.v) < 20
+      : targetDistance < 24;
     if (insideTarget) {
       reached = true;
-      reward += 3600 + (maxSteps - step) * 5 - Math.abs(state.v) * 8;
+      reward += matchHeading
+        ? 4600 + (maxSteps - step) * 5 + (0.2 - targetHeading) * 4200 - Math.abs(state.v) * 9
+        : 3600 + (maxSteps - step) * 5 - Math.abs(state.v) * 7;
       break;
     }
   }
 
   const finalDistance = distance(state, scene.target);
   const finalHeading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
+  const finalProximity = clamp(1 - finalDistance / 140, 0, 1);
+  const finalAlignment = clamp(1 - finalHeading / Math.PI, 0, 1);
   reward -= finalDistance * 2.7;
-  reward -= finalHeading * 38;
+  reward -= matchHeading ? finalHeading * (90 + finalProximity * 520) : finalHeading * 20;
   reward -= pathLength(path) * 0.015;
   reward += Math.max(0, routeLength - finalDistance) * 0.18;
+  if (matchHeading) {
+    reward += finalProximity * finalAlignment * 1200;
+  }
 
-  if (!collided && !reached && finalDistance < 44) {
+  if (!collided && !reached && finalDistance < 44 && (!matchHeading || finalHeading < 0.35)) {
     reward += 640;
+  } else if (matchHeading && !collided && !reached && finalDistance < 44) {
+    reward -= 900 * clamp(finalHeading / Math.PI, 0, 1);
   }
 
   path.push({ x: state.x, y: state.y, theta: state.theta, delta: state.delta, v: state.v });
@@ -445,9 +471,20 @@ function simulate(scene, route, genes, rng, maxSteps) {
 
 function policyAction(scene, state, waypoint, lidar, genes, rng) {
   const car = scene.car;
-  const desiredAngle = Math.atan2(waypoint.y - state.y, waypoint.x - state.x);
+  let desiredAngle = Math.atan2(waypoint.y - state.y, waypoint.x - state.x);
   let angleError = normalizeAngle(desiredAngle - state.theta);
   let desiredSpeed = genes.targetSpeed;
+  const targetDistance = distance(state, scene.target);
+
+  if (scene.config.matchTargetHeading && targetDistance < 115) {
+    const blend = clamp((115 - targetDistance) / 95, 0, 1);
+    desiredAngle = blendAngle(desiredAngle, scene.target.theta, blend * 0.85);
+    desiredSpeed = Math.min(desiredSpeed, Math.max(10, genes.targetSpeed * clamp(targetDistance / 100, 0.2, 0.7)));
+    if (Math.abs(normalizeAngle(scene.target.theta - state.theta)) > 0.28 && targetDistance < 55) {
+      desiredSpeed = Math.min(desiredSpeed, 16);
+    }
+    angleError = normalizeAngle(desiredAngle - state.theta);
+  }
 
   if (Math.abs(angleError) > Math.PI * 0.58) {
     desiredSpeed = -genes.reverseSpeed;
@@ -527,11 +564,29 @@ function stepCar(scene, state, action) {
   return { x, y, theta, v, delta, collision };
 }
 
+function targetApproachPoint(scene) {
+  const distanceBehindTarget = Math.max(scene.car.length * 1.45, 78);
+  const margin = Math.hypot(scene.car.length, scene.car.width) * 0.52;
+  return {
+    x: clamp(scene.target.x - Math.cos(scene.target.theta) * distanceBehindTarget, margin, scene.width - margin),
+    y: clamp(scene.target.y - Math.sin(scene.target.theta) * distanceBehindTarget, margin, scene.height - margin)
+  };
+}
+
+function enforceTerminalWaypoints(route, scene) {
+  const approach = targetApproachPoint(scene);
+  const target = pointFromState(scene.target);
+  const keepDistance = Math.max(scene.car.length * 1.15, 64);
+  const trimmed = route.filter((point, index) => index === 0 || distance(point, target) > keepDistance);
+  return [...trimmed, approach, target];
+}
+
 function buildRoute(scene) {
   const cell = 22;
   const cols = Math.ceil(scene.width / cell);
   const rows = Math.ceil(scene.height / cell);
   const clearance = Math.hypot(scene.car.length, scene.car.width) * 0.42 + 8;
+  const goalPoint = scene.config.matchTargetHeading ? targetApproachPoint(scene) : pointFromState(scene.target);
   const blocked = Array.from({ length: rows }, (_, row) =>
     Array.from({ length: cols }, (_, col) => {
       const x = col * cell + cell / 2;
@@ -544,9 +599,11 @@ function buildRoute(scene) {
   );
 
   const start = cellOf(scene.start, cell, cols, rows);
-  const goal = cellOf(scene.target, cell, cols, rows);
+  const goal = cellOf(goalPoint, cell, cols, rows);
+  const target = cellOf(scene.target, cell, cols, rows);
   clearAround(blocked, start.col, start.row, 1);
   clearAround(blocked, goal.col, goal.row, 1);
+  clearAround(blocked, target.col, target.row, 1);
 
   const key = (col, row) => `${col},${row}`;
   const open = [{ ...start, g: 0, f: heuristic(start, goal), parent: null }];
@@ -573,7 +630,8 @@ function buildRoute(scene) {
     closed.add(currentKey);
 
     if (current.col === goal.col && current.row === goal.row) {
-      return simplifyRoute(unwindRoute(current, cell, scene), scene);
+      const route = simplifyRoute(unwindRoute(current, cell, scene, goalPoint), scene);
+      return scene.config.matchTargetHeading ? enforceTerminalWaypoints(route, scene) : route;
     }
 
     for (const [dc, dr, cost] of dirs) {
@@ -596,7 +654,9 @@ function buildRoute(scene) {
     }
   }
 
-  return [pointFromState(scene.start), pointFromState(scene.target)];
+  return scene.config.matchTargetHeading
+    ? [pointFromState(scene.start), targetApproachPoint(scene), pointFromState(scene.target)]
+    : [pointFromState(scene.start), pointFromState(scene.target)];
 }
 
 function clearAround(blocked, col, row, radius) {
@@ -616,7 +676,7 @@ function cellOf(point, cell, cols, rows) {
   };
 }
 
-function unwindRoute(node, cell, scene) {
+function unwindRoute(node, cell, scene, destination = scene.target) {
   const route = [];
   let current = node;
   while (current) {
@@ -628,7 +688,7 @@ function unwindRoute(node, cell, scene) {
   }
   route.reverse();
   route[0] = pointFromState(scene.start);
-  route[route.length - 1] = pointFromState(scene.target);
+  route[route.length - 1] = pointFromState(destination);
   return route;
 }
 
@@ -913,6 +973,10 @@ function normalizeAngle(angle) {
   while (value <= -Math.PI) value += Math.PI * 2;
   while (value > Math.PI) value -= Math.PI * 2;
   return value;
+}
+
+function blendAngle(from, to, amount) {
+  return normalizeAngle(from + normalizeAngle(to - from) * clamp(amount, 0, 1));
 }
 
 function round(value, decimals = 0) {

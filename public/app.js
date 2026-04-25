@@ -6,6 +6,7 @@ const elements = {
   modeButtons: document.querySelector("#modeButtons"),
   heading: document.querySelector("#heading"),
   headingValue: document.querySelector("#headingValue"),
+  matchHeading: document.querySelector("#matchHeading"),
   hint: document.querySelector("#hint"),
   obstacleLabel: document.querySelector("#obstacleLabel"),
   obstacleFields: [...document.querySelectorAll("[data-obstacle-field]")],
@@ -36,6 +37,13 @@ const car = {
   dragCoefficient: 0.012,
   simulationDt: 0.16,
   integrationStep: 0.032
+};
+
+const targetBay = {
+  length: 68,
+  width: 44,
+  rotateHandleDistance: 48,
+  handleRadius: 8
 };
 
 const state = {
@@ -83,6 +91,10 @@ function bindEvents() {
     }
     updateHeadingLabel();
     render();
+  });
+
+  elements.matchHeading.addEventListener("change", () => {
+    resetTrainingView();
   });
 
   for (const input of elements.obstacleFields) {
@@ -150,8 +162,27 @@ function onPointerDown(event) {
   }
   if (state.mode === "target") {
     clearObstacleSelection();
-    state.target.x = point.x;
-    state.target.y = point.y;
+    const hit = hitTestTarget(point);
+    if (hit === "rotate") {
+      state.drag = { type: "target-rotate", start: point, startTheta: state.target.theta };
+      resetTrainingView();
+      canvas.setPointerCapture(event.pointerId);
+      render();
+      return;
+    }
+    if (hit === "move") {
+      state.drag = {
+        type: "target-move",
+        start: point,
+        offset: { x: point.x - state.target.x, y: point.y - state.target.y }
+      };
+      resetTrainingView();
+      canvas.setPointerCapture(event.pointerId);
+      render();
+      return;
+    }
+    state.target.x = clamp(point.x, targetBay.length / 2, canvas.width - targetBay.length / 2);
+    state.target.y = clamp(point.y, targetBay.width / 2, canvas.height - targetBay.width / 2);
     state.target.theta = degToRad(Number(elements.heading.value));
     resetTrainingView();
     render();
@@ -214,6 +245,12 @@ function onPointerMove(event) {
   } else if (state.drag.type === "resize") {
     resizeSelectedObstacle(point);
     syncObstacleEditor();
+  } else if (state.drag.type === "target-move") {
+    moveTarget(point);
+    syncHeadingFromMode();
+  } else if (state.drag.type === "target-rotate") {
+    rotateTarget(point);
+    syncHeadingFromMode();
   }
   render();
 }
@@ -235,6 +272,8 @@ function onPointerUp(event) {
     }
   } else if (drag.type === "move" || drag.type === "resize") {
     normalizeRect(selectedObstacle());
+    resetTrainingView();
+  } else if (drag.type === "target-move" || drag.type === "target-rotate") {
     resetTrainingView();
   }
   render();
@@ -270,6 +309,23 @@ function deleteSelectedObstacle() {
   resetTrainingView();
   syncObstacleEditor();
   render();
+}
+
+function moveTarget(point) {
+  state.target.x = clamp(
+    point.x - state.drag.offset.x,
+    targetBay.length / 2,
+    canvas.width - targetBay.length / 2
+  );
+  state.target.y = clamp(
+    point.y - state.drag.offset.y,
+    targetBay.width / 2,
+    canvas.height - targetBay.width / 2
+  );
+}
+
+function rotateTarget(point) {
+  state.target.theta = normalizeAngle(Math.atan2(point.y - state.target.y, point.x - state.target.x));
 }
 
 function moveSelectedObstacle(point) {
@@ -392,6 +448,11 @@ function findObstacleAt(point) {
 }
 
 function updateCanvasCursor(point) {
+  if (state.mode === "target") {
+    const hit = hitTestTarget(point);
+    canvas.style.cursor = hit === "rotate" ? "grab" : hit === "move" ? "move" : "crosshair";
+    return;
+  }
   if (state.mode !== "obstacle") {
     canvas.style.cursor = state.mode === "erase" ? "not-allowed" : "";
     return;
@@ -420,6 +481,40 @@ function handleCursor(handle) {
   return cursors[handle] || "default";
 }
 
+function hitTestTarget(point) {
+  const handle = targetRotateHandle();
+  if (Math.hypot(point.x - handle.x, point.y - handle.y) <= targetBay.handleRadius + 5) {
+    return "rotate";
+  }
+  return pointInRotatedTarget(point) ? "move" : null;
+}
+
+function targetRotateHandle() {
+  return {
+    x: state.target.x + Math.cos(state.target.theta) * targetBay.rotateHandleDistance,
+    y: state.target.y + Math.sin(state.target.theta) * targetBay.rotateHandleDistance
+  };
+}
+
+function pointInRotatedTarget(point) {
+  const local = worldToTargetLocal(point);
+  return (
+    Math.abs(local.x) <= targetBay.length / 2 &&
+    Math.abs(local.y) <= targetBay.width / 2
+  );
+}
+
+function worldToTargetLocal(point) {
+  const dx = point.x - state.target.x;
+  const dy = point.y - state.target.y;
+  const cos = Math.cos(-state.target.theta);
+  const sin = Math.sin(-state.target.theta);
+  return {
+    x: dx * cos - dy * sin,
+    y: dx * sin + dy * cos
+  };
+}
+
 async function train() {
   if (state.training) return;
   state.training = true;
@@ -437,7 +532,8 @@ async function train() {
     config: {
       generations: 13,
       population: 22,
-      maxSteps: 340
+      maxSteps: 340,
+      matchTargetHeading: elements.matchHeading.checked
     }
   };
 
@@ -629,13 +725,19 @@ function drawDragPreview() {
 
 function drawTarget() {
   const target = state.target;
+  const showHandle = state.mode === "target" || state.drag?.type?.startsWith("target-");
   ctx.save();
   ctx.translate(target.x, target.y);
   ctx.rotate(target.theta);
+  if (showHandle) {
+    ctx.strokeStyle = "rgba(15, 157, 88, 0.7)";
+    ctx.lineWidth = 2;
+    line(targetBay.length / 2, 0, targetBay.rotateHandleDistance, 0);
+  }
   ctx.fillStyle = "rgba(15, 157, 88, 0.14)";
   ctx.strokeStyle = "#0f9d58";
   ctx.lineWidth = 3;
-  roundRect(-34, -22, 68, 44, 4);
+  roundRect(-targetBay.length / 2, -targetBay.width / 2, targetBay.length, targetBay.width, 4);
   ctx.fill();
   ctx.stroke();
   ctx.strokeStyle = "rgba(15, 157, 88, 0.7)";
@@ -649,6 +751,15 @@ function drawTarget() {
   ctx.lineTo(24, 7);
   ctx.closePath();
   ctx.fill();
+  if (showHandle) {
+    ctx.beginPath();
+    ctx.arc(targetBay.rotateHandleDistance, 0, targetBay.handleRadius, 0, Math.PI * 2);
+    ctx.fillStyle = "#ffffff";
+    ctx.fill();
+    ctx.strokeStyle = "#0f6b41";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -763,7 +874,7 @@ function drawPath(path, options) {
 
 function loadExample() {
   state.start = { x: 116, y: 444, theta: degToRad(-4) };
-  state.target = { x: 778, y: 114, theta: degToRad(180) };
+  state.target = { x: 778, y: 114, theta: 0 };
   state.obstacles = [
     { x: 260, y: 90, w: 74, h: 260 },
     { x: 424, y: 238, w: 236, h: 76 },
@@ -795,7 +906,7 @@ function setStatus(text) {
 
 function syncHeadingFromMode() {
   const theta = state.mode === "target" ? state.target.theta : state.start.theta;
-  elements.heading.value = String(Math.round(radToDeg(theta)));
+  elements.heading.value = String(Math.round(radToDeg(normalizeAngle(theta))));
   updateHeadingLabel();
 }
 
@@ -807,7 +918,7 @@ function updateHint() {
   const hints = {
     car: "Click to place the start car",
     obstacle: "Drag empty space to add; drag selected handles to resize",
-    target: "Click to place the target bay",
+    target: "Drag the target to move; drag its handle to rotate",
     erase: "Click an obstacle to remove it"
   };
   elements.hint.textContent = hints[state.mode];
@@ -894,4 +1005,11 @@ function degToRad(degrees) {
 
 function radToDeg(radians) {
   return (radians * 180) / Math.PI;
+}
+
+function normalizeAngle(angle) {
+  let value = angle;
+  while (value <= -Math.PI) value += Math.PI * 2;
+  while (value > Math.PI) value -= Math.PI * 2;
+  return value;
 }
