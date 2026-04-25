@@ -643,6 +643,17 @@ function handleTrainingEvent(event) {
     return;
   }
 
+  if (event.type === "blocked") {
+    elements.progressBar.style.width = "0%";
+    elements.episodeText.textContent = "0 / 0";
+    elements.rewardText.textContent = "-";
+    elements.distanceText.textContent = "-";
+    elements.clearanceText.textContent = "-";
+    setStatus(event.message || "Target pose blocked");
+    render();
+    return;
+  }
+
   if (event.type === "error") {
     setStatus(event.message || "Training failed");
   }

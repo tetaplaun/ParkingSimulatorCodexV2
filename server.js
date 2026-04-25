@@ -246,11 +246,22 @@ function normalizeCar(raw) {
 
 async function train(scene, send) {
   const rng = mulberry32(Date.now() % 2 ** 32);
-  const routeCandidates = buildRouteCandidates(scene);
+  const routePlan = buildRouteCandidates(scene);
+  const routeCandidates = routePlan.candidates;
   const total = scene.config.maxEpisodes;
   const totalGenerations = Math.ceil(total / scene.config.population);
   let episode = 0;
   let best = null;
+
+  if (!routeCandidates.length) {
+    send({
+      type: "blocked",
+      message: routePlan.reason || "Target pose is blocked. Move or rotate the target, or clear space on one side of it.",
+      rejected: routePlan.rejected
+    });
+    return;
+  }
+
   const distributions = new Map(routeCandidates.map((candidate) => [
     candidate.mode,
     {
@@ -265,8 +276,10 @@ async function train(scene, send) {
     route: routeCandidates[0]?.points || [],
     routeCandidates: routeCandidates.map((candidate) => ({
       mode: candidate.mode,
-      points: candidate.points
+      points: candidate.points,
+      feasible: candidate.feasible
     })),
+    rejectedRoutes: routePlan.rejected,
     lidarAngles: makeLidarAngles(scene.car).map((a) => round(a, 4)),
     config: scene.config
   });
@@ -623,6 +636,56 @@ function targetApproachPoint(scene, mode = "forward") {
   };
 }
 
+function targetPose(scene) {
+  return {
+    x: scene.target.x,
+    y: scene.target.y,
+    theta: scene.target.theta,
+    v: 0,
+    delta: 0
+  };
+}
+
+function approachPose(scene, mode = "forward") {
+  const point = targetApproachPoint(scene, mode);
+  return {
+    x: point.x,
+    y: point.y,
+    theta: scene.target.theta,
+    v: 0,
+    delta: 0
+  };
+}
+
+function validateTerminalApproach(scene, mode) {
+  const target = targetPose(scene);
+  const approach = approachPose(scene, mode);
+
+  if (isCollision(scene, target)) {
+    return { ok: false, reason: "target pose overlaps an obstacle or boundary" };
+  }
+  if (isCollision(scene, approach)) {
+    return { ok: false, reason: `${mode} staging pose is blocked` };
+  }
+
+  const samples = Math.max(6, Math.ceil(distance(target, approach) / 8));
+  for (let i = 1; i < samples; i += 1) {
+    const t = i / samples;
+    const pose = {
+      x: approach.x + (target.x - approach.x) * t,
+      y: approach.y + (target.y - approach.y) * t,
+      theta: scene.target.theta,
+      v: 0,
+      delta: 0
+    };
+    if (isCollision(scene, pose)) {
+      return { ok: false, reason: `${mode} final corridor is blocked` };
+    }
+  }
+
+  return { ok: true };
+}
+
 function enforceTerminalWaypoints(route, scene, mode = "forward") {
   const approach = targetApproachPoint(scene, mode);
   const target = pointFromState(scene.target);
@@ -633,16 +696,47 @@ function enforceTerminalWaypoints(route, scene, mode = "forward") {
 
 function buildRouteCandidates(scene) {
   if (!scene.config.matchTargetHeading) {
-    return [buildRouteForMode(scene, "direct")];
+    const direct = buildRouteForMode(scene, "direct");
+    return direct.feasible
+      ? { candidates: [direct], rejected: [] }
+      : { candidates: [], rejected: [summarizeRejectedRoute(direct)], reason: "No collision-free route to the target position was found." };
   }
 
-  return [
-    buildRouteForMode(scene, "forward"),
-    buildRouteForMode(scene, "reverse")
-  ];
+  const candidates = ["forward", "reverse"].map((mode) => buildRouteForMode(scene, mode));
+  const feasible = candidates.filter((candidate) => candidate.feasible);
+  const rejected = candidates
+    .filter((candidate) => !candidate.feasible)
+    .map(summarizeRejectedRoute);
+
+  return {
+    candidates: feasible,
+    rejected,
+    reason: feasible.length
+      ? null
+      : "Target pose is blocked for both forward-in and back-in approaches."
+  };
 }
 
 function buildRouteForMode(scene, mode = "direct") {
+  if (mode !== "direct") {
+    const terminal = validateTerminalApproach(scene, mode);
+    if (!terminal.ok) {
+      return {
+        mode,
+        points: [],
+        feasible: false,
+        reason: terminal.reason
+      };
+    }
+  } else if (isCollision(scene, targetPose(scene))) {
+    return {
+      mode,
+      points: [],
+      feasible: false,
+      reason: "target position overlaps an obstacle or boundary"
+    };
+  }
+
   const cell = 22;
   const cols = Math.ceil(scene.width / cell);
   const rows = Math.ceil(scene.height / cell);
@@ -694,6 +788,7 @@ function buildRouteForMode(scene, mode = "direct") {
       const route = simplifyRoute(unwindRoute(current, cell, scene, goalPoint), scene);
       return {
         mode,
+        feasible: true,
         points: mode === "direct" ? route : enforceTerminalWaypoints(route, scene, mode)
       };
     }
@@ -720,9 +815,18 @@ function buildRouteForMode(scene, mode = "direct") {
 
   return {
     mode,
-    points: mode === "direct"
-      ? [pointFromState(scene.start), pointFromState(scene.target)]
-      : [pointFromState(scene.start), targetApproachPoint(scene, mode), pointFromState(scene.target)]
+    points: [],
+    feasible: false,
+    reason: mode === "direct"
+      ? "no collision-free route to target"
+      : `no collision-free route to ${mode} staging pose`
+  };
+}
+
+function summarizeRejectedRoute(candidate) {
+  return {
+    mode: candidate.mode,
+    reason: candidate.reason || "blocked"
   };
 }
 
