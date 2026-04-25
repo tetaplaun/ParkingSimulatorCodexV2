@@ -191,12 +191,18 @@ function normalizeScene(payload) {
     },
     obstacles: [],
     config: {
-      generations: clampInt(payload.config?.generations, 6, 26, 13),
-      population: clampInt(payload.config?.population, 8, 44, 22),
+      maxEpisodes: clampInt(
+        payload.config?.maxEpisodes ?? payload.config?.episodes,
+        24,
+        10000,
+        clampInt(payload.config?.generations, 1, 1000, 25) * clampInt(payload.config?.population, 8, 64, 24)
+      ),
+      population: clampInt(payload.config?.population, 8, 64, 24),
       maxSteps: clampInt(payload.config?.maxSteps, 160, 520, 340),
       matchTargetHeading: payload.config?.matchTargetHeading !== false
     }
   };
+  scene.config.generations = Math.ceil(scene.config.maxEpisodes / scene.config.population);
 
   scene.obstacles = Array.isArray(payload.obstacles)
     ? payload.obstacles
@@ -241,7 +247,8 @@ function normalizeCar(raw) {
 async function train(scene, send) {
   const rng = mulberry32(Date.now() % 2 ** 32);
   const route = buildRoute(scene);
-  const total = scene.config.generations * scene.config.population;
+  const total = scene.config.maxEpisodes;
+  const totalGenerations = Math.ceil(total / scene.config.population);
   let episode = 0;
   let best = null;
   let mean = PARAMS.map((p) => p.seed);
@@ -255,18 +262,21 @@ async function train(scene, send) {
     config: scene.config
   });
 
-  for (let generation = 1; generation <= scene.config.generations; generation += 1) {
+  for (let generation = 1; episode < total; generation += 1) {
     const evaluated = [];
+    const currentPopulation = Math.min(scene.config.population, total - episode);
 
-    for (let i = 0; i < scene.config.population; i += 1) {
+    for (let i = 0; i < currentPopulation; i += 1) {
       const vector = sampleVector(mean, std, rng);
       const genes = vectorToGenes(vector);
       const result = simulate(scene, route, genes, rng, scene.config.maxSteps);
       episode += 1;
       evaluated.push({ vector, result });
 
+      let improvedBest = false;
       if (!best || result.reward > best.result.reward) {
         best = { vector, result, generation, episode };
+        improvedBest = true;
       }
 
       send({
@@ -280,7 +290,7 @@ async function train(scene, send) {
         progress: round(episode / total, 4),
         path: compressPath(result.path),
         bestReward: round(best.result.reward, 2),
-        bestPath: compressPath(best.result.path),
+        bestPath: improvedBest ? compressPath(best.result.path) : undefined,
         lidar: result.lidarSnapshot,
         metrics: {
           distance: round(result.finalDistance, 1),
@@ -293,7 +303,7 @@ async function train(scene, send) {
     }
 
     evaluated.sort((a, b) => b.result.reward - a.result.reward);
-    const eliteCount = Math.max(3, Math.ceil(evaluated.length * 0.25));
+    const eliteCount = Math.max(1, Math.ceil(evaluated.length * 0.25));
     const elites = evaluated.slice(0, eliteCount);
     const next = updateDistribution(mean, std, elites.map((e) => e.vector));
     mean = next.mean;
@@ -302,7 +312,7 @@ async function train(scene, send) {
     send({
       type: "generation",
       generation,
-      totalGenerations: scene.config.generations,
+      totalGenerations,
       bestReward: round(best.result.reward, 2),
       bestDistance: round(best.result.finalDistance, 1),
       reached: best.result.reached,

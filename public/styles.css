@@ -206,6 +206,29 @@ canvas {
   accent-color: #16864f;
 }
 
+.number-field {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.number-field input {
+  width: 100%;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 9px;
+  color: var(--ink);
+  background: #fff;
+}
+
+.number-field input:focus,
+.number-grid input:focus {
+  outline: 2px solid rgba(22, 134, 79, 0.28);
+  border-color: #16864f;
+}
+
 .obstacle-editor {
   border: 1px solid var(--line);
   border-radius: 8px;

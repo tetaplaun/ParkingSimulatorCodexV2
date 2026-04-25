@@ -7,6 +7,7 @@ const elements = {
   heading: document.querySelector("#heading"),
   headingValue: document.querySelector("#headingValue"),
   matchHeading: document.querySelector("#matchHeading"),
+  maxEpisodes: document.querySelector("#maxEpisodes"),
   hint: document.querySelector("#hint"),
   obstacleLabel: document.querySelector("#obstacleLabel"),
   obstacleFields: [...document.querySelectorAll("[data-obstacle-field]")],
@@ -94,6 +95,11 @@ function bindEvents() {
   });
 
   elements.matchHeading.addEventListener("change", () => {
+    resetTrainingView();
+  });
+
+  elements.maxEpisodes.addEventListener("change", () => {
+    elements.maxEpisodes.value = String(readMaxEpisodes());
     resetTrainingView();
   });
 
@@ -521,6 +527,8 @@ async function train() {
   resetTrainingView();
   setStatus("Training");
   elements.trainButton.disabled = true;
+  elements.matchHeading.disabled = true;
+  elements.maxEpisodes.disabled = true;
 
   const payload = {
     width: canvas.width,
@@ -530,8 +538,8 @@ async function train() {
     obstacles: state.obstacles,
     car,
     config: {
-      generations: 13,
-      population: 22,
+      maxEpisodes: readMaxEpisodes(),
+      population: 24,
       maxSteps: 340,
       matchTargetHeading: elements.matchHeading.checked
     }
@@ -573,6 +581,8 @@ async function train() {
   } finally {
     state.training = false;
     elements.trainButton.disabled = false;
+    elements.matchHeading.disabled = false;
+    elements.maxEpisodes.disabled = false;
     render();
   }
 }
@@ -902,6 +912,10 @@ function resetTrainingView() {
 
 function setStatus(text) {
   elements.statusText.textContent = text;
+}
+
+function readMaxEpisodes() {
+  return Math.round(clamp(Number(elements.maxEpisodes.value) || 600, 50, 10000));
 }
 
 function syncHeadingFromMode() {
