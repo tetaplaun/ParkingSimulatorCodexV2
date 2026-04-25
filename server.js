@@ -199,7 +199,8 @@ function normalizeScene(payload) {
       ),
       population: clampInt(payload.config?.population, 8, 64, 24),
       maxSteps: clampInt(payload.config?.maxSteps, 220, 1200, 620),
-      matchTargetHeading: payload.config?.matchTargetHeading !== false
+      matchTargetHeading: payload.config?.matchTargetHeading !== false,
+      solveMode: payload.config?.solveMode === "plan" ? "plan" : "train"
     }
   };
   scene.config.generations = Math.ceil(scene.config.maxEpisodes / scene.config.population);
@@ -248,15 +249,19 @@ async function train(scene, send) {
   const rng = mulberry32(Date.now() % 2 ** 32);
   const routePlan = buildRouteCandidates(scene);
   const routeCandidates = routePlan.candidates;
-  const total = scene.config.maxEpisodes;
+  const solveMode = scene.config.solveMode;
+  const total = solveMode === "plan" ? 1 : scene.config.maxEpisodes;
   const totalGenerations = Math.ceil(total / scene.config.population);
   let episode = 0;
   let best = null;
-  const expertResult = routeCandidates.length ? makeExpertResult(scene, routeCandidates) : null;
+  const expertResult = solveMode === "plan" && routeCandidates.length
+    ? makeExpertResult(scene, routeCandidates)
+    : null;
 
   if (!routeCandidates.length) {
     send({
       type: "blocked",
+      solveMode,
       message: routePlan.reason || "Target pose is blocked. Move or rotate the target, or clear space on one side of it.",
       rejected: routePlan.rejected
     });
@@ -273,6 +278,7 @@ async function train(scene, send) {
 
   send({
     type: "start",
+    solveMode,
     total,
     route: routeCandidates[0]?.points || [],
     routeCandidates: routeCandidates.map((candidate) => ({
@@ -285,7 +291,17 @@ async function train(scene, send) {
     config: scene.config
   });
 
-  if (expertResult) {
+  if (solveMode === "plan") {
+    if (!expertResult) {
+      send({
+        type: "blocked",
+        solveMode,
+        message: "No physically feasible planned path was found. Try Train for rollout search or adjust the scene.",
+        rejected: routePlan.rejected
+      });
+      return;
+    }
+
     best = {
       vector: PARAMS.map((param) => param.seed),
       result: expertResult,
@@ -294,15 +310,16 @@ async function train(scene, send) {
     };
     send({
       type: "episode",
-      source: "seed",
+      solveMode,
+      source: "plan",
       generation: 0,
-      episode: 0,
+      episode: 1,
       total,
       reward: round(expertResult.reward, 2),
       reached: expertResult.reached,
       collided: expertResult.collided,
       bestReached: expertResult.reached,
-      progress: 0,
+      progress: 1,
       path: compressPath(expertResult.path),
       bestReward: round(expertResult.reward, 2),
       bestPath: compressPath(expertResult.path),
@@ -321,6 +338,9 @@ async function train(scene, send) {
         steps: expertResult.steps
       }
     });
+
+    sendDone(send, best, 1, total, { solveMode, solvedByPlan: true });
+    return;
   }
 
   for (let generation = 1; episode < total; generation += 1) {
@@ -344,6 +364,7 @@ async function train(scene, send) {
 
       send({
         type: "episode",
+        solveMode,
         source: "rollout",
         generation,
         episode,
@@ -394,6 +415,7 @@ async function train(scene, send) {
 
     send({
       type: "generation",
+      solveMode,
       generation,
       totalGenerations,
       bestReward: round(best.result.reward, 2),
@@ -404,8 +426,17 @@ async function train(scene, send) {
     });
   }
 
+  sendDone(send, best, episode, total, { solveMode });
+}
+
+function sendDone(send, best, episode, total, meta = {}) {
   send({
     type: "done",
+    solveMode: meta.solveMode || "train",
+    solvedBySeed: Boolean(meta.solvedBySeed),
+    solvedByPlan: Boolean(meta.solvedByPlan),
+    episode,
+    total,
     bestReward: round(best.result.reward, 2),
     bestPath: compressPath(best.result.path),
     route: best.result.route,
@@ -413,6 +444,7 @@ async function train(scene, send) {
     reached: best.result.reached,
     collided: best.result.collided,
     distance: round(best.result.finalDistance, 1),
+    clearance: round(best.result.minClearance, 1),
     genes: vectorToGenes(best.vector)
   });
 }
@@ -726,17 +758,6 @@ function hybridAStar(scene, options = {}) {
       return reconstructHybridPath(node, node.usedReverse);
     }
 
-    const terminal = terminalConnection(scene, node.state);
-    const terminalUsesReverse = terminal?.some((sample) => sample.v < 0) ?? false;
-    if (terminal && (!mustUseReverse || node.usedReverse || terminalUsesReverse)) {
-      return reconstructHybridPath({
-        state: terminal[terminal.length - 1],
-        parent: node,
-        samples: terminal,
-        usedReverse: node.usedReverse || terminalUsesReverse
-      }, node.usedReverse || terminalUsesReverse);
-    }
-
     if (hybridHeuristic(scene, node.state) < hybridHeuristic(scene, bestNode.state)) {
       bestNode = node;
     }
@@ -791,42 +812,6 @@ function hybridGoalReached(scene, state) {
   }
   const heading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
   return d < 18 && heading < 0.2;
-}
-
-function terminalConnection(scene, state) {
-  if (!scene.config.matchTargetHeading) {
-    return null;
-  }
-  const frame = targetFrame(scene, state);
-  const heading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
-  if (heading > 0.26 || Math.abs(frame.lateral) > 12 || Math.abs(frame.forward) > 190) {
-    return null;
-  }
-  const direction = frame.forward > 0 ? -1 : 1;
-  return propagateToTarget(scene, state, direction);
-}
-
-function propagateToTarget(scene, state, direction) {
-  const samples = [];
-  let current = { ...state, delta: 0, v: direction * 18 };
-  const total = distance(current, scene.target);
-  const steps = Math.max(1, Math.ceil(total / 4));
-  for (let i = 1; i <= steps; i += 1) {
-    const t = i / steps;
-    current = {
-      x: state.x + (scene.target.x - state.x) * t,
-      y: state.y + (scene.target.y - state.y) * t,
-      theta: blendAngle(state.theta, scene.target.theta, t),
-      delta: 0,
-      v: direction * 18
-    };
-    if (isCollision(scene, current)) {
-      return null;
-    }
-    samples.push(current);
-  }
-  samples.push({ x: scene.target.x, y: scene.target.y, theta: scene.target.theta, delta: 0, v: 0 });
-  return samples;
 }
 
 function propagatePrimitive(scene, state, direction, steer, distanceToTravel, stepDistance) {

@@ -109,6 +109,13 @@ p {
   font-size: 14px;
 }
 
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .primary {
   min-width: 108px;
   color: #fff;
@@ -120,6 +127,18 @@ p {
 .primary:hover {
   background: #137947;
   border-color: #115f39;
+}
+
+.secondary {
+  min-width: 92px;
+  border-color: #9ca898;
+  background: #f8faf7;
+  font-weight: 700;
+}
+
+.secondary:not(:disabled):hover {
+  background: #eef4ec;
+  border-color: #7e8b7a;
 }
 
 .canvas-wrap {
@@ -397,7 +416,13 @@ dd {
     flex-direction: column;
   }
 
-  .primary {
+  .top-actions {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+  }
+
+  .primary,
+  .secondary {
     width: 100%;
   }
 

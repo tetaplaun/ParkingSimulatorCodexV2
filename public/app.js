@@ -3,6 +3,8 @@ const ctx = canvas.getContext("2d");
 
 const elements = {
   trainButton: document.querySelector("#trainButton"),
+  planButton: document.querySelector("#planButton"),
+  playButton: document.querySelector("#playButton"),
   modeButtons: document.querySelector("#modeButtons"),
   heading: document.querySelector("#heading"),
   headingValue: document.querySelector("#headingValue"),
@@ -62,7 +64,14 @@ const state = {
   bestParkingMode: null,
   currentPath: [],
   lidar: null,
-  training: false
+  training: false,
+  playback: {
+    active: false,
+    pose: null,
+    frame: 0,
+    startedAt: 0,
+    duration: 0
+  }
 };
 
 loadExample();
@@ -113,7 +122,9 @@ function bindEvents() {
 
   elements.deleteObstacleButton.addEventListener("click", deleteSelectedObstacle);
 
-  elements.trainButton.addEventListener("click", train);
+  elements.planButton.addEventListener("click", () => runSolver("plan"));
+  elements.trainButton.addEventListener("click", () => runSolver("train"));
+  elements.playButton.addEventListener("click", togglePlayback);
   elements.exampleButton.addEventListener("click", () => {
     loadExample();
     resetTrainingView();
@@ -523,12 +534,78 @@ function worldToTargetLocal(point) {
   };
 }
 
-async function train() {
+function togglePlayback() {
+  if (state.playback.active) {
+    stopPlayback({ resetPose: true, renderNow: true });
+    setStatus("Playback stopped");
+    return;
+  }
+  startPlayback();
+}
+
+function startPlayback() {
+  if (state.training || state.bestPath.length < 2) return;
+  stopPlayback({ resetPose: true });
+  const totalDistance = pathLength(state.bestPath);
+  state.playback.active = true;
+  state.playback.pose = state.bestPath[0];
+  state.playback.startedAt = performance.now();
+  state.playback.duration = clamp((totalDistance / 115) * 1000, 1800, 18000);
+  elements.playButton.textContent = "Stop";
+  elements.playButton.disabled = false;
+  setStatus("Playing path");
+  state.playback.frame = requestAnimationFrame(stepPlayback);
+}
+
+function stepPlayback(timestamp) {
+  if (!state.playback.active) return;
+  const elapsed = timestamp - state.playback.startedAt;
+  const progress = clamp(elapsed / state.playback.duration, 0, 1);
+  state.playback.pose = samplePath(state.bestPath, progress);
+  render();
+  if (progress >= 1) {
+    stopPlayback({ resetPose: false });
+    setStatus("Playback complete");
+    render();
+    return;
+  }
+  state.playback.frame = requestAnimationFrame(stepPlayback);
+}
+
+function stopPlayback(options = {}) {
+  const { resetPose = true, renderNow = false } = options;
+  if (state.playback.frame) {
+    cancelAnimationFrame(state.playback.frame);
+  }
+  state.playback.active = false;
+  state.playback.frame = 0;
+  state.playback.startedAt = 0;
+  state.playback.duration = 0;
+  if (resetPose) {
+    state.playback.pose = null;
+  }
+  updatePlaybackControls();
+  if (renderNow) {
+    render();
+  }
+}
+
+function updatePlaybackControls() {
+  const canPlay = state.bestPath.length >= 2 && !state.training;
+  elements.playButton.disabled = !canPlay && !state.playback.active;
+  elements.playButton.textContent = state.playback.active ? "Stop" : "Play";
+  elements.playButton.title = canPlay ? "Play the determined path" : "Plan or train first to determine a path";
+}
+
+async function runSolver(solveMode) {
   if (state.training) return;
+  stopPlayback({ resetPose: true });
   state.training = true;
   resetTrainingView();
-  setStatus("Training");
+  setStatus(solveMode === "plan" ? "Planning" : "Training");
+  elements.planButton.disabled = true;
   elements.trainButton.disabled = true;
+  elements.playButton.disabled = true;
   elements.matchHeading.disabled = true;
   elements.maxEpisodes.disabled = true;
 
@@ -543,7 +620,8 @@ async function train() {
       maxEpisodes: readMaxEpisodes(),
       population: 24,
       maxSteps: 340,
-      matchTargetHeading: elements.matchHeading.checked
+      matchTargetHeading: elements.matchHeading.checked,
+      solveMode
     }
   };
 
@@ -574,7 +652,7 @@ async function train() {
           const event = JSON.parse(line);
           handleTrainingEvent(event);
           eventsSincePaint += 1;
-          if (event.source === "seed" || event.bestPath?.length || eventsSincePaint >= 20) {
+          if (event.source === "plan" || event.source === "seed" || event.bestPath?.length || eventsSincePaint >= 20) {
             eventsSincePaint = 0;
             await nextPaint();
           }
@@ -586,12 +664,14 @@ async function train() {
       handleTrainingEvent(JSON.parse(buffer));
     }
   } catch (error) {
-    setStatus(error.message || "Training failed");
+    setStatus(error.message || (solveMode === "plan" ? "Planning failed" : "Training failed"));
   } finally {
     state.training = false;
+    elements.planButton.disabled = false;
     elements.trainButton.disabled = false;
     elements.matchHeading.disabled = false;
     elements.maxEpisodes.disabled = false;
+    updatePlaybackControls();
     render();
   }
 }
@@ -605,7 +685,7 @@ function handleTrainingEvent(event) {
     state.route = event.route || [];
     elements.episodeText.textContent = `0 / ${event.total}`;
     elements.progressBar.style.width = "0%";
-    setStatus("Training");
+    setStatus(event.solveMode === "plan" ? "Planning" : "Training");
     render();
     return;
   }
@@ -615,7 +695,7 @@ function handleTrainingEvent(event) {
       state.route = event.route;
     }
     state.currentPath = event.path || [];
-    if (event.path?.length && event.source !== "seed") {
+    if (event.path?.length && event.source !== "seed" && event.source !== "plan") {
       state.trials.push({
         path: event.path,
         reward: event.reward,
@@ -640,9 +720,9 @@ function handleTrainingEvent(event) {
     const displayedMetrics = event.bestMetrics || event.metrics;
     elements.distanceText.textContent = `${formatNumber(displayedMetrics.distance)} px`;
     elements.clearanceText.textContent = `${formatNumber(displayedMetrics.clearance)} px`;
-    if (event.source === "seed" && state.bestReached) {
+    if ((event.source === "seed" || event.source === "plan") && state.bestReached) {
       const mode = state.bestParkingMode === "reverse" ? "back-in" : "forward-in";
-      setStatus(`Seeded solution (${mode})`);
+      setStatus(event.source === "plan" ? `Path planned (${mode})` : `Seeded solution (${mode})`);
     }
     render();
     return;
@@ -659,10 +739,24 @@ function handleTrainingEvent(event) {
     state.bestReached = Boolean(event.reached);
     state.bestParkingMode = event.parkingMode || state.bestParkingMode;
     elements.progressBar.style.width = "100%";
+    if (event.solvedByPlan) {
+      elements.episodeText.textContent = "plan";
+    } else if (event.solvedBySeed) {
+      elements.episodeText.textContent = "seed";
+    } else if (Number.isFinite(Number(event.episode)) && Number.isFinite(Number(event.total))) {
+      elements.episodeText.textContent = `${event.episode} / ${event.total}`;
+    }
     elements.rewardText.textContent = formatNumber(event.bestReward);
     elements.distanceText.textContent = `${formatNumber(event.distance)} px`;
+    if (Number.isFinite(Number(event.clearance))) {
+      elements.clearanceText.textContent = `${formatNumber(event.clearance)} px`;
+    }
     const mode = event.parkingMode === "reverse" ? "back-in" : "forward-in";
-    setStatus(event.reached ? `Target reached (${mode})` : `Best effort (${mode})`);
+    if (event.solvedByPlan) {
+      setStatus(event.reached ? `Path planned (${mode})` : `Plan failed (${mode})`);
+    } else {
+      setStatus(event.reached ? `Target reached (${mode})` : `Best effort (${mode})`);
+    }
     render();
     return;
   }
@@ -684,6 +778,7 @@ function handleTrainingEvent(event) {
 }
 
 function render() {
+  updatePlaybackControls();
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   drawLot();
   drawRoute();
@@ -694,6 +789,7 @@ function render() {
   drawTarget();
   drawBestPath();
   drawLidar();
+  drawPlaybackCar();
   drawCar(state.start, "#1976d2");
 }
 
@@ -881,8 +977,14 @@ function drawBestPath() {
   if (state.bestPath.length < 2) return;
   drawPath(state.bestPath, { color: "#f5b82e", width: 5 });
   drawPath(state.bestPath, { color: "#7a4e00", width: 1.5 });
+  if (state.playback.pose) return;
   const last = state.bestPath[state.bestPath.length - 1];
   drawCar(last, "#f5b82e");
+}
+
+function drawPlaybackCar() {
+  if (!state.playback.pose) return;
+  drawCar(state.playback.pose, "#f5b82e");
 }
 
 function drawLidar() {
@@ -939,6 +1041,7 @@ function loadExample() {
 }
 
 function resetTrainingView() {
+  stopPlayback({ resetPose: true });
   state.route = [];
   state.trials = [];
   state.bestPath = [];
@@ -1046,6 +1149,48 @@ function roundRect(x, y, width, height, radius) {
   ctx.arcTo(x, y + height, x, y, r);
   ctx.arcTo(x, y, x + width, y, r);
   ctx.closePath();
+}
+
+function samplePath(path, progress) {
+  if (!path.length) return null;
+  if (progress <= 0) return path[0];
+  if (progress >= 1) return path[path.length - 1];
+
+  const targetDistance = pathLength(path) * progress;
+  let traveled = 0;
+  for (let index = 1; index < path.length; index += 1) {
+    const from = path[index - 1];
+    const to = path[index];
+    const segment = distance(from, to);
+    if (traveled + segment >= targetDistance) {
+      const t = segment > 0 ? (targetDistance - traveled) / segment : 0;
+      return {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t,
+        theta: blendAngle(from.theta ?? 0, to.theta ?? 0, t),
+        delta: (from.delta ?? 0) + ((to.delta ?? 0) - (from.delta ?? 0)) * t,
+        v: (from.v ?? 0) + ((to.v ?? 0) - (from.v ?? 0)) * t
+      };
+    }
+    traveled += segment;
+  }
+  return path[path.length - 1];
+}
+
+function pathLength(path) {
+  let total = 0;
+  for (let index = 1; index < path.length; index += 1) {
+    total += distance(path[index - 1], path[index]);
+  }
+  return total;
+}
+
+function distance(a, b) {
+  return Math.hypot((a?.x ?? 0) - (b?.x ?? 0), (a?.y ?? 0) - (b?.y ?? 0));
+}
+
+function blendAngle(from, to, t) {
+  return normalizeAngle(from + normalizeAngle(to - from) * t);
 }
 
 function formatNumber(value) {
