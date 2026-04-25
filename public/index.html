@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking RL Simulator</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <div class="topbar">
+          <div>
+            <h1>Parking RL Simulator</h1>
+            <p>Place the start car, draw obstacles, set a target, then train.</p>
+          </div>
+          <button id="trainButton" class="primary">Train</button>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="scene" width="900" height="560" aria-label="Parking simulator scene"></canvas>
+          <div id="hint" class="hint">Drag to add an obstacle</div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="tool-group">
+          <h2>Place</h2>
+          <div class="segmented" id="modeButtons">
+            <button data-mode="car" title="Place start car">Car</button>
+            <button data-mode="obstacle" class="active" title="Draw obstacle">Obstacle</button>
+            <button data-mode="target" title="Place parking target">Target</button>
+            <button data-mode="erase" title="Remove obstacle">Erase</button>
+          </div>
+        </div>
+
+        <label class="field">
+          <span>Heading</span>
+          <input id="heading" type="range" min="-180" max="180" step="1" value="0">
+          <output id="headingValue">0 deg</output>
+        </label>
+
+        <div class="obstacle-editor" id="obstacleEditor">
+          <div class="status-row">
+            <span>Obstacle</span>
+            <strong id="obstacleLabel">None</strong>
+          </div>
+          <div class="number-grid">
+            <label>
+              <span>X</span>
+              <input type="number" min="0" max="900" step="1" data-obstacle-field="x" disabled>
+            </label>
+            <label>
+              <span>Y</span>
+              <input type="number" min="0" max="560" step="1" data-obstacle-field="y" disabled>
+            </label>
+            <label>
+              <span>W</span>
+              <input type="number" min="16" max="900" step="1" data-obstacle-field="w" disabled>
+            </label>
+            <label>
+              <span>H</span>
+              <input type="number" min="16" max="560" step="1" data-obstacle-field="h" disabled>
+            </label>
+          </div>
+          <button id="deleteObstacleButton" disabled>Delete selected</button>
+        </div>
+
+        <div class="tool-grid">
+          <button id="exampleButton">Example</button>
+          <button id="clearTrailsButton">Clear trails</button>
+          <button id="clearObstaclesButton">Clear obstacles</button>
+          <button id="resetButton">Reset scene</button>
+        </div>
+
+        <div class="status">
+          <div class="status-row">
+            <span>Status</span>
+            <strong id="statusText">Ready</strong>
+          </div>
+          <div class="progress">
+            <div id="progressBar"></div>
+          </div>
+          <dl>
+            <div>
+              <dt>Episode</dt>
+              <dd id="episodeText">0 / 0</dd>
+            </div>
+            <div>
+              <dt>Best reward</dt>
+              <dd id="rewardText">-</dd>
+            </div>
+            <div>
+              <dt>Distance</dt>
+              <dd id="distanceText">-</dd>
+            </div>
+            <div>
+              <dt>Clearance</dt>
+              <dd id="clearanceText">-</dd>
+            </div>
+          </dl>
+        </div>
+
+        <div class="legend">
+          <span><i class="start"></i> Start</span>
+          <span><i class="target"></i> Target</span>
+          <span><i class="trial"></i> Trials</span>
+          <span><i class="best"></i> Best</span>
+        </div>
+      </aside>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
