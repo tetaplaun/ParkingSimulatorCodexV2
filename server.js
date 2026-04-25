@@ -246,18 +246,27 @@ function normalizeCar(raw) {
 
 async function train(scene, send) {
   const rng = mulberry32(Date.now() % 2 ** 32);
-  const route = buildRoute(scene);
+  const routeCandidates = buildRouteCandidates(scene);
   const total = scene.config.maxEpisodes;
   const totalGenerations = Math.ceil(total / scene.config.population);
   let episode = 0;
   let best = null;
-  let mean = PARAMS.map((p) => p.seed);
-  let std = PARAMS.map((p) => (p.max - p.min) * 0.28);
+  const distributions = new Map(routeCandidates.map((candidate) => [
+    candidate.mode,
+    {
+      mean: PARAMS.map((p) => p.seed),
+      std: PARAMS.map((p) => (p.max - p.min) * 0.28)
+    }
+  ]));
 
   send({
     type: "start",
     total,
-    route,
+    route: routeCandidates[0]?.points || [],
+    routeCandidates: routeCandidates.map((candidate) => ({
+      mode: candidate.mode,
+      points: candidate.points
+    })),
     lidarAngles: makeLidarAngles(scene.car).map((a) => round(a, 4)),
     config: scene.config
   });
@@ -267,11 +276,13 @@ async function train(scene, send) {
     const currentPopulation = Math.min(scene.config.population, total - episode);
 
     for (let i = 0; i < currentPopulation; i += 1) {
-      const vector = sampleVector(mean, std, rng);
+      const routeCandidate = routeCandidates[episode % routeCandidates.length];
+      const distribution = distributions.get(routeCandidate.mode);
+      const vector = sampleVector(distribution.mean, distribution.std, rng);
       const genes = vectorToGenes(vector);
-      const result = simulate(scene, route, genes, rng, scene.config.maxSteps);
+      const result = simulate(scene, routeCandidate, genes, rng, scene.config.maxSteps);
       episode += 1;
-      evaluated.push({ vector, result });
+      evaluated.push({ routeMode: routeCandidate.mode, vector, result });
 
       let improvedBest = false;
       if (!best || result.reward > best.result.reward) {
@@ -291,6 +302,8 @@ async function train(scene, send) {
         path: compressPath(result.path),
         bestReward: round(best.result.reward, 2),
         bestPath: improvedBest ? compressPath(best.result.path) : undefined,
+        route: improvedBest ? best.result.route : undefined,
+        parkingMode: result.parkingMode,
         lidar: result.lidarSnapshot,
         metrics: {
           distance: round(result.finalDistance, 1),
@@ -302,12 +315,22 @@ async function train(scene, send) {
       await yieldToEventLoop();
     }
 
-    evaluated.sort((a, b) => b.result.reward - a.result.reward);
-    const eliteCount = Math.max(1, Math.ceil(evaluated.length * 0.25));
-    const elites = evaluated.slice(0, eliteCount);
-    const next = updateDistribution(mean, std, elites.map((e) => e.vector));
-    mean = next.mean;
-    std = next.std;
+    for (const candidate of routeCandidates) {
+      const modeEvaluations = evaluated
+        .filter((entry) => entry.routeMode === candidate.mode)
+        .sort((a, b) => b.result.reward - a.result.reward);
+      if (!modeEvaluations.length) {
+        continue;
+      }
+      const distribution = distributions.get(candidate.mode);
+      const eliteCount = Math.max(1, Math.ceil(modeEvaluations.length * 0.25));
+      const elites = modeEvaluations.slice(0, eliteCount);
+      const next = updateDistribution(distribution.mean, distribution.std, elites.map((entry) => entry.vector));
+      distribution.mean = next.mean;
+      distribution.std = next.std;
+    }
+
+    const bestDistribution = best ? distributions.get(best.result.parkingMode) : distributions.get(routeCandidates[0].mode);
 
     send({
       type: "generation",
@@ -316,7 +339,8 @@ async function train(scene, send) {
       bestReward: round(best.result.reward, 2),
       bestDistance: round(best.result.finalDistance, 1),
       reached: best.result.reached,
-      mean: vectorToGenes(mean)
+      parkingMode: best.result.parkingMode,
+      mean: bestDistribution ? vectorToGenes(bestDistribution.mean) : {}
     });
   }
 
@@ -324,6 +348,8 @@ async function train(scene, send) {
     type: "done",
     bestReward: round(best.result.reward, 2),
     bestPath: compressPath(best.result.path),
+    route: best.result.route,
+    parkingMode: best.result.parkingMode,
     reached: best.result.reached,
     collided: best.result.collided,
     distance: round(best.result.finalDistance, 1),
@@ -364,9 +390,11 @@ function updateDistribution(mean, std, eliteVectors) {
   return { mean: nextMean, std: nextStd };
 }
 
-function simulate(scene, route, genes, rng, maxSteps) {
+function simulate(scene, routeCandidate, genes, rng, maxSteps) {
   const car = scene.car;
   const matchHeading = scene.config.matchTargetHeading;
+  const route = Array.isArray(routeCandidate) ? routeCandidate : routeCandidate?.points || [];
+  const parkingMode = Array.isArray(routeCandidate) ? "forward" : routeCandidate?.mode || "forward";
   let state = { ...scene.start, v: 0, delta: 0 };
   let waypointIndex = 0;
   let reward = 0;
@@ -379,21 +407,22 @@ function simulate(scene, route, genes, rng, maxSteps) {
   const baseRoute = route.length
     ? route
     : matchHeading
-      ? [pointFromState(scene.start), targetApproachPoint(scene), pointFromState(scene.target)]
+      ? [pointFromState(scene.start), targetApproachPoint(scene, parkingMode), pointFromState(scene.target)]
       : [pointFromState(scene.start), pointFromState(scene.target)];
   const shiftedRoute = offsetRoute(baseRoute, genes.sideOffset);
-  const waypoints = matchHeading ? enforceTerminalWaypoints(shiftedRoute, scene) : shiftedRoute;
+  const waypoints = matchHeading ? enforceTerminalWaypoints(shiftedRoute, scene, parkingMode) : shiftedRoute;
   const routeLength = estimateRouteLength(waypoints);
 
   for (let step = 0; step < maxSteps; step += 1) {
     waypointIndex = advanceWaypoint(state, waypoints, waypointIndex, genes.waypointRadius);
     const waypoint = chooseLookahead(state, waypoints, waypointIndex, genes.lookahead);
+    const terminalLeg = waypointIndex >= waypoints.length - 2;
     const lidar = getLidar(scene, state);
     const minLidar = Math.min(...lidar.distances);
     minClearance = Math.min(minClearance, minLidar);
     lidarSnapshot = lidar;
 
-    const action = policyAction(scene, state, waypoint, lidar, genes, rng);
+    const action = policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode, terminalLeg);
     const previousState = state;
     state = stepCar(scene, state, action);
 
@@ -465,6 +494,8 @@ function simulate(scene, route, genes, rng, maxSteps) {
     reached,
     collided,
     path,
+    route,
+    parkingMode,
     finalDistance,
     minClearance,
     steps: path.length,
@@ -479,16 +510,24 @@ function simulate(scene, route, genes, rng, maxSteps) {
   };
 }
 
-function policyAction(scene, state, waypoint, lidar, genes, rng) {
+function policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode = "forward", terminalLeg = false) {
   const car = scene.car;
   let desiredAngle = Math.atan2(waypoint.y - state.y, waypoint.x - state.x);
   let angleError = normalizeAngle(desiredAngle - state.theta);
   let desiredSpeed = genes.targetSpeed;
   const targetDistance = distance(state, scene.target);
+  const reverseTerminal = scene.config.matchTargetHeading && parkingMode === "reverse" && terminalLeg && targetDistance < 150;
 
-  if (scene.config.matchTargetHeading && targetDistance < 115) {
+  if (reverseTerminal) {
+    desiredAngle = Math.atan2(scene.target.y - state.y, scene.target.x - state.x);
+    desiredSpeed = -Math.max(8, genes.reverseSpeed * clamp(targetDistance / 95, 0.22, 0.9));
+    angleError = normalizeAngle(desiredAngle - normalizeAngle(state.theta + Math.PI));
+  } else if (scene.config.matchTargetHeading && targetDistance < 115) {
     const blend = clamp((115 - targetDistance) / 95, 0, 1);
-    desiredAngle = blendAngle(desiredAngle, scene.target.theta, blend * 0.85);
+    const terminalTravelAngle = parkingMode === "reverse"
+      ? normalizeAngle(scene.target.theta + Math.PI)
+      : scene.target.theta;
+    desiredAngle = blendAngle(desiredAngle, terminalTravelAngle, blend * 0.9);
     desiredSpeed = Math.min(desiredSpeed, Math.max(10, genes.targetSpeed * clamp(targetDistance / 100, 0.2, 0.7)));
     if (Math.abs(normalizeAngle(scene.target.theta - state.theta)) > 0.28 && targetDistance < 55) {
       desiredSpeed = Math.min(desiredSpeed, 16);
@@ -496,7 +535,7 @@ function policyAction(scene, state, waypoint, lidar, genes, rng) {
     angleError = normalizeAngle(desiredAngle - state.theta);
   }
 
-  if (Math.abs(angleError) > Math.PI * 0.58) {
+  if (!reverseTerminal && Math.abs(angleError) > Math.PI * 0.58) {
     desiredSpeed = -genes.reverseSpeed;
     angleError = normalizeAngle(desiredAngle - normalizeAngle(state.theta + Math.PI));
   }
@@ -516,7 +555,7 @@ function policyAction(scene, state, waypoint, lidar, genes, rng) {
     }
   }
 
-  const speedLimit = frontClearance < genes.brakeDistance
+  const speedLimit = frontClearance < genes.brakeDistance && desiredSpeed > 0
     ? Math.max(12, desiredSpeed * clamp(frontClearance / genes.brakeDistance, 0.18, 1))
     : desiredSpeed;
   const targetSpeed = desiredSpeed < 0 ? desiredSpeed : speedLimit;
@@ -574,29 +613,41 @@ function stepCar(scene, state, action) {
   return { x, y, theta, v, delta, collision };
 }
 
-function targetApproachPoint(scene) {
+function targetApproachPoint(scene, mode = "forward") {
   const distanceBehindTarget = Math.max(scene.car.length * 1.45, 78);
   const margin = Math.hypot(scene.car.length, scene.car.width) * 0.52;
+  const direction = mode === "reverse" ? 1 : -1;
   return {
-    x: clamp(scene.target.x - Math.cos(scene.target.theta) * distanceBehindTarget, margin, scene.width - margin),
-    y: clamp(scene.target.y - Math.sin(scene.target.theta) * distanceBehindTarget, margin, scene.height - margin)
+    x: clamp(scene.target.x + Math.cos(scene.target.theta) * distanceBehindTarget * direction, margin, scene.width - margin),
+    y: clamp(scene.target.y + Math.sin(scene.target.theta) * distanceBehindTarget * direction, margin, scene.height - margin)
   };
 }
 
-function enforceTerminalWaypoints(route, scene) {
-  const approach = targetApproachPoint(scene);
+function enforceTerminalWaypoints(route, scene, mode = "forward") {
+  const approach = targetApproachPoint(scene, mode);
   const target = pointFromState(scene.target);
   const keepDistance = Math.max(scene.car.length * 1.15, 64);
   const trimmed = route.filter((point, index) => index === 0 || distance(point, target) > keepDistance);
   return [...trimmed, approach, target];
 }
 
-function buildRoute(scene) {
+function buildRouteCandidates(scene) {
+  if (!scene.config.matchTargetHeading) {
+    return [buildRouteForMode(scene, "direct")];
+  }
+
+  return [
+    buildRouteForMode(scene, "forward"),
+    buildRouteForMode(scene, "reverse")
+  ];
+}
+
+function buildRouteForMode(scene, mode = "direct") {
   const cell = 22;
   const cols = Math.ceil(scene.width / cell);
   const rows = Math.ceil(scene.height / cell);
   const clearance = Math.hypot(scene.car.length, scene.car.width) * 0.42 + 8;
-  const goalPoint = scene.config.matchTargetHeading ? targetApproachPoint(scene) : pointFromState(scene.target);
+  const goalPoint = mode === "direct" ? pointFromState(scene.target) : targetApproachPoint(scene, mode);
   const blocked = Array.from({ length: rows }, (_, row) =>
     Array.from({ length: cols }, (_, col) => {
       const x = col * cell + cell / 2;
@@ -641,7 +692,10 @@ function buildRoute(scene) {
 
     if (current.col === goal.col && current.row === goal.row) {
       const route = simplifyRoute(unwindRoute(current, cell, scene, goalPoint), scene);
-      return scene.config.matchTargetHeading ? enforceTerminalWaypoints(route, scene) : route;
+      return {
+        mode,
+        points: mode === "direct" ? route : enforceTerminalWaypoints(route, scene, mode)
+      };
     }
 
     for (const [dc, dr, cost] of dirs) {
@@ -664,9 +718,12 @@ function buildRoute(scene) {
     }
   }
 
-  return scene.config.matchTargetHeading
-    ? [pointFromState(scene.start), targetApproachPoint(scene), pointFromState(scene.target)]
-    : [pointFromState(scene.start), pointFromState(scene.target)];
+  return {
+    mode,
+    points: mode === "direct"
+      ? [pointFromState(scene.start), pointFromState(scene.target)]
+      : [pointFromState(scene.start), targetApproachPoint(scene, mode), pointFromState(scene.target)]
+  };
 }
 
 function clearAround(blocked, col, row, radius) {

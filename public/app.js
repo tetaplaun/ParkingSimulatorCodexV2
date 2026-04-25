@@ -598,6 +598,9 @@ function handleTrainingEvent(event) {
   }
 
   if (event.type === "episode") {
+    if (event.route?.length) {
+      state.route = event.route;
+    }
     state.currentPath = event.path || [];
     if (event.path?.length) {
       state.trials.push({
@@ -630,10 +633,12 @@ function handleTrainingEvent(event) {
 
   if (event.type === "done") {
     state.bestPath = event.bestPath || state.bestPath;
+    state.route = event.route || state.route;
     elements.progressBar.style.width = "100%";
     elements.rewardText.textContent = formatNumber(event.bestReward);
     elements.distanceText.textContent = `${formatNumber(event.distance)} px`;
-    setStatus(event.reached ? "Target reached" : "Best effort");
+    const mode = event.parkingMode === "reverse" ? "back-in" : "forward-in";
+    setStatus(event.reached ? `Target reached (${mode})` : `Best effort (${mode})`);
     render();
     return;
   }
