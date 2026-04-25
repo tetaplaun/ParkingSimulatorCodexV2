@@ -198,7 +198,7 @@ function normalizeScene(payload) {
         clampInt(payload.config?.generations, 1, 1000, 25) * clampInt(payload.config?.population, 8, 64, 24)
       ),
       population: clampInt(payload.config?.population, 8, 64, 24),
-      maxSteps: clampInt(payload.config?.maxSteps, 160, 520, 340),
+      maxSteps: clampInt(payload.config?.maxSteps, 220, 1200, 620),
       matchTargetHeading: payload.config?.matchTargetHeading !== false
     }
   };
@@ -252,6 +252,7 @@ async function train(scene, send) {
   const totalGenerations = Math.ceil(total / scene.config.population);
   let episode = 0;
   let best = null;
+  const expertResult = routeCandidates.length ? makeExpertResult(scene, routeCandidates) : null;
 
   if (!routeCandidates.length) {
     send({
@@ -284,6 +285,36 @@ async function train(scene, send) {
     config: scene.config
   });
 
+  if (expertResult) {
+    best = {
+      vector: PARAMS.map((param) => param.seed),
+      result: expertResult,
+      generation: 0,
+      episode: 0
+    };
+    send({
+      type: "episode",
+      generation: 0,
+      episode: 0,
+      total,
+      reward: round(expertResult.reward, 2),
+      reached: expertResult.reached,
+      collided: expertResult.collided,
+      progress: 0,
+      path: compressPath(expertResult.path),
+      bestReward: round(expertResult.reward, 2),
+      bestPath: compressPath(expertResult.path),
+      route: expertResult.route,
+      parkingMode: expertResult.parkingMode,
+      lidar: expertResult.lidarSnapshot,
+      metrics: {
+        distance: round(expertResult.finalDistance, 1),
+        clearance: round(expertResult.minClearance, 1),
+        steps: expertResult.steps
+      }
+    });
+  }
+
   for (let generation = 1; episode < total; generation += 1) {
     const evaluated = [];
     const currentPopulation = Math.min(scene.config.population, total - episode);
@@ -298,7 +329,7 @@ async function train(scene, send) {
       evaluated.push({ routeMode: routeCandidate.mode, vector, result });
 
       let improvedBest = false;
-      if (!best || result.reward > best.result.reward) {
+      if (!best || result.score > best.result.score) {
         best = { vector, result, generation, episode };
         improvedBest = true;
       }
@@ -331,7 +362,7 @@ async function train(scene, send) {
     for (const candidate of routeCandidates) {
       const modeEvaluations = evaluated
         .filter((entry) => entry.routeMode === candidate.mode)
-        .sort((a, b) => b.result.reward - a.result.reward);
+        .sort((a, b) => b.result.score - a.result.score);
       if (!modeEvaluations.length) {
         continue;
       }
@@ -417,25 +448,54 @@ function simulate(scene, routeCandidate, genes, rng, maxSteps) {
   let closestDistance = distance(state, scene.target);
   const path = [{ x: state.x, y: state.y, theta: state.theta, delta: state.delta, v: state.v }];
   let lidarSnapshot = null;
+  let reverseCommitted = false;
   const baseRoute = route.length
     ? route
     : matchHeading
-      ? [pointFromState(scene.start), targetApproachPoint(scene, parkingMode), pointFromState(scene.target)]
+      ? [
+          pointFromState(scene.start),
+          targetApproachPoint(scene, parkingMode, "near"),
+          pointFromState(scene.target)
+        ]
       : [pointFromState(scene.start), pointFromState(scene.target)];
   const shiftedRoute = offsetRoute(baseRoute, genes.sideOffset);
   const waypoints = matchHeading ? enforceTerminalWaypoints(shiftedRoute, scene, parkingMode) : shiftedRoute;
   const routeLength = estimateRouteLength(waypoints);
 
   for (let step = 0; step < maxSteps; step += 1) {
-    waypointIndex = advanceWaypoint(state, waypoints, waypointIndex, genes.waypointRadius);
-    const waypoint = chooseLookahead(state, waypoints, waypointIndex, genes.lookahead);
-    const terminalLeg = waypointIndex >= waypoints.length - 2;
+    const terminalStart = parkingMode === "reverse" ? waypoints.length - 4 : Infinity;
+    const terminalRadii = parkingMode === "reverse"
+      ? new Map([
+          [waypoints.length - 4, 30],
+          [waypoints.length - 3, 12]
+        ])
+      : null;
+    waypointIndex = advanceWaypoint(state, waypoints, waypointIndex, genes.waypointRadius, terminalStart, 12, terminalRadii);
+    const distanceToTargetNow = distance(state, scene.target);
+    const terminalLeg = parkingMode === "reverse"
+      ? waypointIndex >= waypoints.length - 4 || distanceToTargetNow < 190
+      : waypointIndex >= waypoints.length - 2;
+    const terminalLookahead = terminalLeg ? Math.min(genes.lookahead, 28) : genes.lookahead;
+    let waypoint = chooseLookahead(state, waypoints, waypointIndex, terminalLookahead);
+    const reverseSetupLeg = parkingMode === "reverse" && (
+      waypointIndex === waypoints.length - 4 || waypointIndex === waypoints.length - 3
+    );
+    if (reverseSetupLeg) {
+      waypoint = waypoints[waypointIndex] ?? waypoint;
+    }
+    if (parkingMode === "reverse" && terminalLeg && !reverseCommitted && readyForReverse(scene, state)) {
+      reverseCommitted = true;
+    }
+    const reverseLeg = parkingMode === "reverse" && reverseCommitted;
+    if (reverseLeg) {
+      waypoint = pointFromState(scene.target);
+    }
     const lidar = getLidar(scene, state);
     const minLidar = Math.min(...lidar.distances);
     minClearance = Math.min(minClearance, minLidar);
     lidarSnapshot = lidar;
 
-    const action = policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode, terminalLeg);
+    const action = policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode, terminalLeg, reverseLeg);
     const previousState = state;
     state = stepCar(scene, state, action);
 
@@ -466,7 +526,7 @@ function simulate(scene, routeCandidate, genes, rng, maxSteps) {
 
     collided = state.collision || isCollision(scene, state);
     if (collided) {
-      reward -= 2600 + (maxSteps - step) * 2;
+      reward -= 12000 + (maxSteps - step) * 8;
       break;
     }
 
@@ -490,6 +550,9 @@ function simulate(scene, routeCandidate, genes, rng, maxSteps) {
   reward -= matchHeading ? finalHeading * (90 + finalProximity * 520) : finalHeading * 20;
   reward -= pathLength(path) * 0.015;
   reward += Math.max(0, routeLength - finalDistance) * 0.18;
+  if (!collided) {
+    reward += 1800;
+  }
   if (matchHeading) {
     reward += finalProximity * finalAlignment * 1200;
   }
@@ -500,9 +563,20 @@ function simulate(scene, routeCandidate, genes, rng, maxSteps) {
     reward -= 900 * clamp(finalHeading / Math.PI, 0, 1);
   }
 
+  const score = scoreResult({
+    reward,
+    reached,
+    collided,
+    finalDistance,
+    finalHeading,
+    minClearance,
+    path
+  }, matchHeading);
+
   path.push({ x: state.x, y: state.y, theta: state.theta, delta: state.delta, v: state.v });
 
   return {
+    score,
     reward,
     reached,
     collided,
@@ -523,24 +597,352 @@ function simulate(scene, routeCandidate, genes, rng, maxSteps) {
   };
 }
 
-function policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode = "forward", terminalLeg = false) {
+function scoreResult(result, matchHeading) {
+  const alignmentPenalty = matchHeading ? result.finalHeading * 62000 : 0;
+  const reachBonus = result.reached ? 1_000_000 : 0;
+  const safetyBonus = result.collided ? -320_000 : 260_000;
+  const clearanceBonus = clamp(result.minClearance, 0, 80) * 180;
+  const distancePenalty = result.finalDistance * (matchHeading ? 2400 : 1600);
+  const pathPenalty = pathLength(result.path) * 1.1;
+  return reachBonus + safetyBonus + clearanceBonus - distancePenalty - alignmentPenalty - pathPenalty + result.reward * 0.02;
+}
+
+function makeExpertResult(scene, routeCandidates = []) {
+  const mustUseReverse = scene.config.matchTargetHeading &&
+    routeCandidates.some((candidate) => candidate.mode === "reverse") &&
+    !routeCandidates.some((candidate) => candidate.mode === "forward");
+  const plan = hybridAStar(scene, { mustUseReverse });
+  if (!plan) {
+    return null;
+  }
+
+  let minClearance = scene.car.lidarRange;
+  let lidarSnapshot = null;
+  let collided = false;
+  for (const state of plan.path) {
+    const lidar = getLidar(scene, state);
+    lidarSnapshot = lidar;
+    minClearance = Math.min(minClearance, Math.min(...lidar.distances));
+    if (isCollision(scene, state)) {
+      collided = true;
+      break;
+    }
+  }
+
+  const final = plan.path[plan.path.length - 1] ?? scene.start;
+  const finalDistance = distance(final, scene.target);
+  const finalHeading = Math.abs(normalizeAngle(scene.target.theta - final.theta));
+  const reached = !collided && (
+    scene.config.matchTargetHeading
+      ? finalDistance < 18 && finalHeading < 0.2
+      : finalDistance < 24
+  );
+  const reward = reached ? 85000 : 42000 - finalDistance * 220 - finalHeading * 8000;
+  const result = {
+    reward,
+    reached,
+    collided,
+    path: plan.path,
+    route: plan.path.map(pointFromState),
+    parkingMode: plan.usedReverse ? "reverse" : "forward",
+    finalDistance,
+    minClearance,
+    steps: plan.path.length,
+    lidarSnapshot: lidarSnapshot
+      ? {
+          origin: { x: round(lidarSnapshot.origin.x, 1), y: round(lidarSnapshot.origin.y, 1) },
+          angles: lidarSnapshot.angles.map((a) => round(a, 4)),
+          distances: lidarSnapshot.distances.map((d) => round(d, 1)),
+          range: scene.car.lidarRange
+        }
+      : null
+  };
+  result.score = scoreResult({
+    reward: result.reward,
+    reached: result.reached,
+    collided: result.collided,
+    finalDistance: result.finalDistance,
+    finalHeading,
+    minClearance: result.minClearance,
+    path: result.path
+  }, scene.config.matchTargetHeading);
+  return result;
+}
+
+function hybridAStar(scene, options = {}) {
+  const mustUseReverse = options.mustUseReverse === true;
+  const car = scene.car;
+  const resolution = 16;
+  const thetaBins = 48;
+  const primitiveDistance = 22;
+  const primitiveStep = 4.4;
+  const maxExpansions = 24000;
+  const steerSet = [-car.maxSteer, -car.maxSteer * 0.55, 0, car.maxSteer * 0.55, car.maxSteer];
+  const directionSet = scene.config.matchTargetHeading ? [1, -1] : [1];
+  const start = {
+    x: scene.start.x,
+    y: scene.start.y,
+    theta: scene.start.theta,
+    v: 0,
+    delta: 0
+  };
+  const root = {
+    state: start,
+    g: 0,
+    f: hybridHeuristic(scene, start),
+    parent: null,
+    samples: [],
+    direction: 0,
+    steer: 0,
+    usedReverse: false
+  };
+  const heap = [root];
+  const bestCost = new Map([[hybridKey(start, resolution, thetaBins), 0]]);
+  let bestNode = root;
+
+  for (let expansions = 0; heap.length && expansions < maxExpansions; expansions += 1) {
+    const node = heapPop(heap);
+    if (!node) {
+      break;
+    }
+
+    if ((!mustUseReverse || node.usedReverse) && hybridGoalReached(scene, node.state)) {
+      return reconstructHybridPath(node, node.usedReverse);
+    }
+
+    const terminal = terminalConnection(scene, node.state);
+    const terminalUsesReverse = terminal?.some((sample) => sample.v < 0) ?? false;
+    if (terminal && (!mustUseReverse || node.usedReverse || terminalUsesReverse)) {
+      return reconstructHybridPath({
+        state: terminal[terminal.length - 1],
+        parent: node,
+        samples: terminal,
+        usedReverse: node.usedReverse || terminalUsesReverse
+      }, node.usedReverse || terminalUsesReverse);
+    }
+
+    if (hybridHeuristic(scene, node.state) < hybridHeuristic(scene, bestNode.state)) {
+      bestNode = node;
+    }
+
+    for (const direction of directionSet) {
+      for (const steer of steerSet) {
+        const primitive = propagatePrimitive(scene, node.state, direction, steer, primitiveDistance, primitiveStep);
+        if (!primitive) {
+          continue;
+        }
+        const next = primitive[primitive.length - 1];
+        const key = hybridKey(next, resolution, thetaBins);
+        const switchPenalty = node.direction && node.direction !== direction ? 34 : 0;
+        const reversePenalty = direction < 0 ? 6 : 0;
+        const steerPenalty = Math.abs(steer) * 7 + Math.abs(steer - node.steer) * 5;
+        const g = node.g + primitiveDistance + switchPenalty + reversePenalty + steerPenalty;
+        if (g >= (bestCost.get(key) ?? Infinity)) {
+          continue;
+        }
+        bestCost.set(key, g);
+        heapPush(heap, {
+          state: next,
+          g,
+          f: g + hybridHeuristic(scene, next),
+          parent: node,
+          samples: primitive,
+          direction,
+          steer,
+          usedReverse: node.usedReverse || direction < 0
+        });
+      }
+    }
+  }
+
+  return (!mustUseReverse || bestNode.usedReverse) && hybridGoalReached(scene, bestNode.state)
+    ? reconstructHybridPath(bestNode, bestNode.usedReverse)
+    : null;
+}
+
+function hybridHeuristic(scene, state) {
+  const d = distance(state, scene.target);
+  const heading = scene.config.matchTargetHeading
+    ? Math.abs(normalizeAngle(scene.target.theta - state.theta))
+    : 0;
+  return d * 1.35 + heading * 52;
+}
+
+function hybridGoalReached(scene, state) {
+  const d = distance(state, scene.target);
+  if (!scene.config.matchTargetHeading) {
+    return d < 24;
+  }
+  const heading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
+  return d < 18 && heading < 0.2;
+}
+
+function terminalConnection(scene, state) {
+  if (!scene.config.matchTargetHeading) {
+    return null;
+  }
+  const frame = targetFrame(scene, state);
+  const heading = Math.abs(normalizeAngle(scene.target.theta - state.theta));
+  if (heading > 0.26 || Math.abs(frame.lateral) > 12 || Math.abs(frame.forward) > 190) {
+    return null;
+  }
+  const direction = frame.forward > 0 ? -1 : 1;
+  return propagateToTarget(scene, state, direction);
+}
+
+function propagateToTarget(scene, state, direction) {
+  const samples = [];
+  let current = { ...state, delta: 0, v: direction * 18 };
+  const total = distance(current, scene.target);
+  const steps = Math.max(1, Math.ceil(total / 4));
+  for (let i = 1; i <= steps; i += 1) {
+    const t = i / steps;
+    current = {
+      x: state.x + (scene.target.x - state.x) * t,
+      y: state.y + (scene.target.y - state.y) * t,
+      theta: blendAngle(state.theta, scene.target.theta, t),
+      delta: 0,
+      v: direction * 18
+    };
+    if (isCollision(scene, current)) {
+      return null;
+    }
+    samples.push(current);
+  }
+  samples.push({ x: scene.target.x, y: scene.target.y, theta: scene.target.theta, delta: 0, v: 0 });
+  return samples;
+}
+
+function propagatePrimitive(scene, state, direction, steer, distanceToTravel, stepDistance) {
+  const car = scene.car;
+  const samples = [];
+  const steps = Math.max(1, Math.ceil(distanceToTravel / stepDistance));
+  const ds = distanceToTravel / steps;
+  let x = state.x;
+  let y = state.y;
+  let theta = state.theta;
+
+  for (let i = 0; i < steps; i += 1) {
+    const beta = Math.atan(0.5 * Math.tan(steer));
+    x += direction * ds * Math.cos(theta + beta);
+    y += direction * ds * Math.sin(theta + beta);
+    theta = normalizeAngle(theta + (direction * ds / car.wheelBase) * Math.cos(beta) * Math.tan(steer));
+    const sample = { x, y, theta, delta: steer, v: direction * 24 };
+    if (isCollision(scene, sample)) {
+      return null;
+    }
+    samples.push(sample);
+  }
+  return samples;
+}
+
+function reconstructHybridPath(node, usedReverse) {
+  const reversed = [];
+  let current = node;
+  while (current) {
+    for (let i = current.samples.length - 1; i >= 0; i -= 1) {
+      reversed.push(current.samples[i]);
+    }
+    if (!current.parent) {
+      reversed.push(current.state);
+    }
+    current = current.parent;
+  }
+  reversed.reverse();
+  return { path: dedupePath(reversed), usedReverse };
+}
+
+function dedupePath(path) {
+  const result = [];
+  for (const point of path) {
+    const previous = result[result.length - 1];
+    if (
+      !previous ||
+      distance(previous, point) > 0.5 ||
+      Math.abs(normalizeAngle((previous.theta ?? 0) - (point.theta ?? 0))) > 0.01 ||
+      Math.abs((previous.v ?? 0) - (point.v ?? 0)) > 0.5
+    ) {
+      result.push(point);
+    }
+  }
+  return result;
+}
+
+function hybridKey(state, resolution, thetaBins) {
+  const theta = normalizeAngle(state.theta);
+  const thetaIndex = clampInt(Math.floor(((theta + Math.PI) / (Math.PI * 2)) * thetaBins), 0, thetaBins - 1, 0);
+  return `${Math.round(state.x / resolution)},${Math.round(state.y / resolution)},${thetaIndex}`;
+}
+
+function heapPush(heap, node) {
+  heap.push(node);
+  let index = heap.length - 1;
+  while (index > 0) {
+    const parent = Math.floor((index - 1) / 2);
+    if (heap[parent].f <= node.f) {
+      break;
+    }
+    heap[index] = heap[parent];
+    index = parent;
+  }
+  heap[index] = node;
+}
+
+function heapPop(heap) {
+  if (!heap.length) {
+    return null;
+  }
+  const top = heap[0];
+  const last = heap.pop();
+  if (heap.length && last) {
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      const right = left + 1;
+      if (left >= heap.length) {
+        break;
+      }
+      const child = right < heap.length && heap[right].f < heap[left].f ? right : left;
+      if (heap[child].f >= last.f) {
+        break;
+      }
+      heap[index] = heap[child];
+      index = child;
+    }
+    heap[index] = last;
+  }
+  return top;
+}
+
+function policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode = "forward", terminalLeg = false, reverseLeg = false) {
   const car = scene.car;
   let desiredAngle = Math.atan2(waypoint.y - state.y, waypoint.x - state.x);
   let angleError = normalizeAngle(desiredAngle - state.theta);
   let desiredSpeed = genes.targetSpeed;
   const targetDistance = distance(state, scene.target);
-  const reverseTerminal = scene.config.matchTargetHeading && parkingMode === "reverse" && terminalLeg && targetDistance < 150;
+  const reverseTerminal = scene.config.matchTargetHeading && parkingMode === "reverse" && reverseLeg;
 
   if (reverseTerminal) {
-    desiredAngle = Math.atan2(scene.target.y - state.y, scene.target.x - state.x);
-    desiredSpeed = -Math.max(8, genes.reverseSpeed * clamp(targetDistance / 95, 0.22, 0.9));
+    const frame = targetFrame(scene, state);
+    const lateralCorrection = clamp(Math.atan2(frame.lateral, 82), -0.72, 0.72);
+    desiredAngle = normalizeAngle(scene.target.theta + Math.PI - lateralCorrection);
+    desiredSpeed = -Math.max(8, genes.reverseSpeed * clamp(targetDistance / 145, 0.2, 0.9));
     angleError = normalizeAngle(desiredAngle - normalizeAngle(state.theta + Math.PI));
-  } else if (scene.config.matchTargetHeading && targetDistance < 115) {
+  } else if (scene.config.matchTargetHeading && parkingMode === "reverse" && terminalLeg) {
+    const frame = targetFrame(scene, state);
+    const farFrame = targetFrame(scene, targetApproachPoint(scene, "reverse", "far"));
+    const lateralCorrection = clamp(Math.atan2(frame.lateral, 94), -0.78, 0.78);
+    const laneAngle = normalizeAngle(scene.target.theta - lateralCorrection);
+    const setupProgress = clamp(frame.forward / Math.max(1, farFrame.forward), 0, 1);
+    desiredAngle = blendAngle(desiredAngle, laneAngle, 0.82 + setupProgress * 0.16);
+    desiredSpeed = Math.min(desiredSpeed, Math.max(18, genes.targetSpeed * 0.45));
+    if (frame.forward > farFrame.forward - 28 && Math.abs(frame.lateral) < 26) {
+      desiredSpeed = Math.min(desiredSpeed, 13);
+    }
+    angleError = normalizeAngle(desiredAngle - state.theta);
+  } else if (scene.config.matchTargetHeading && parkingMode !== "reverse" && targetDistance < 115) {
     const blend = clamp((115 - targetDistance) / 95, 0, 1);
-    const terminalTravelAngle = parkingMode === "reverse"
-      ? normalizeAngle(scene.target.theta + Math.PI)
-      : scene.target.theta;
-    desiredAngle = blendAngle(desiredAngle, terminalTravelAngle, blend * 0.9);
+    desiredAngle = blendAngle(desiredAngle, scene.target.theta, blend * 0.9);
     desiredSpeed = Math.min(desiredSpeed, Math.max(10, genes.targetSpeed * clamp(targetDistance / 100, 0.2, 0.7)));
     if (Math.abs(normalizeAngle(scene.target.theta - state.theta)) > 0.28 && targetDistance < 55) {
       desiredSpeed = Math.min(desiredSpeed, 16);
@@ -548,7 +950,8 @@ function policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode = "
     angleError = normalizeAngle(desiredAngle - state.theta);
   }
 
-  if (!reverseTerminal && Math.abs(angleError) > Math.PI * 0.58) {
+  const allowAutoReverse = !(parkingMode === "reverse" && terminalLeg);
+  if (allowAutoReverse && !reverseTerminal && Math.abs(angleError) > Math.PI * 0.58) {
     desiredSpeed = -genes.reverseSpeed;
     angleError = normalizeAngle(desiredAngle - normalizeAngle(state.theta + Math.PI));
   }
@@ -568,15 +971,24 @@ function policyAction(scene, state, waypoint, lidar, genes, rng, parkingMode = "
     }
   }
 
-  const speedLimit = frontClearance < genes.brakeDistance && desiredSpeed > 0
+  const terminalParkingLane = parkingMode === "reverse" && terminalLeg;
+  const speedLimit = !terminalParkingLane && frontClearance < genes.brakeDistance && desiredSpeed > 0
     ? Math.max(12, desiredSpeed * clamp(frontClearance / genes.brakeDistance, 0.18, 1))
     : desiredSpeed;
   const targetSpeed = desiredSpeed < 0 ? desiredSpeed : speedLimit;
   let throttle = clamp((targetSpeed - state.v) / 48 + genes.throttleBias, -1, 1);
-  if (frontClearance < car.length * 0.55 && state.v > 0) {
+  if (terminalParkingLane) {
+    if (targetSpeed > 0 && state.v < targetSpeed * 0.82) {
+      throttle = Math.max(throttle, 0.28);
+    } else if (targetSpeed < 0 && state.v > targetSpeed * 0.82) {
+      throttle = Math.min(throttle, -0.34);
+    }
+  }
+  if (!terminalParkingLane && frontClearance < car.length * 0.55 && state.v > 0) {
     throttle = -1;
   }
-  const rawSteer = angleError * genes.steerGain + avoid * genes.avoidGain + genes.steerBias;
+  const avoidScale = terminalParkingLane ? 0.2 : 1;
+  const rawSteer = angleError * genes.steerGain + avoid * genes.avoidGain * avoidScale + genes.steerBias;
   const smoothed = state.delta * genes.smoothSteer + rawSteer * (1 - genes.smoothSteer);
 
   return {
@@ -626,8 +1038,10 @@ function stepCar(scene, state, action) {
   return { x, y, theta, v, delta, collision };
 }
 
-function targetApproachPoint(scene, mode = "forward") {
-  const distanceBehindTarget = Math.max(scene.car.length * 1.45, 78);
+function targetApproachPoint(scene, mode = "forward", stage = "near") {
+  const distanceBehindTarget = mode === "reverse" && stage === "far"
+    ? Math.max(scene.car.length * 2.9, 156)
+    : Math.max(scene.car.length * 1.45, 78);
   const margin = Math.hypot(scene.car.length, scene.car.width) * 0.52;
   const direction = mode === "reverse" ? 1 : -1;
   return {
@@ -646,8 +1060,31 @@ function targetPose(scene) {
   };
 }
 
+function targetFrame(scene, point) {
+  const dx = point.x - scene.target.x;
+  const dy = point.y - scene.target.y;
+  const cos = Math.cos(scene.target.theta);
+  const sin = Math.sin(scene.target.theta);
+  return {
+    forward: dx * cos + dy * sin,
+    lateral: -dx * sin + dy * cos
+  };
+}
+
+function readyForReverse(scene, state) {
+  const frame = targetFrame(scene, state);
+  const farFrame = targetFrame(scene, targetApproachPoint(scene, "reverse", "far"));
+  const headingError = Math.abs(normalizeAngle(scene.target.theta - state.theta));
+  return (
+    frame.forward >= farFrame.forward - 18 &&
+    Math.abs(frame.lateral) <= 34 &&
+    headingError <= 0.72 &&
+    Math.abs(state.v) <= 24
+  );
+}
+
 function approachPose(scene, mode = "forward") {
-  const point = targetApproachPoint(scene, mode);
+  const point = targetApproachPoint(scene, mode, mode === "reverse" ? "far" : "near");
   return {
     x: point.x,
     y: point.y,
@@ -659,27 +1096,36 @@ function approachPose(scene, mode = "forward") {
 
 function validateTerminalApproach(scene, mode) {
   const target = targetPose(scene);
-  const approach = approachPose(scene, mode);
+  const approaches = mode === "reverse"
+    ? [approachPose(scene, mode), { ...targetApproachPoint(scene, mode, "near"), theta: scene.target.theta, v: 0, delta: 0 }]
+    : [approachPose(scene, mode)];
 
   if (isCollision(scene, target)) {
     return { ok: false, reason: "target pose overlaps an obstacle or boundary" };
   }
-  if (isCollision(scene, approach)) {
-    return { ok: false, reason: `${mode} staging pose is blocked` };
+  for (const approach of approaches) {
+    if (isCollision(scene, approach)) {
+      return { ok: false, reason: `${mode} staging pose is blocked` };
+    }
   }
 
-  const samples = Math.max(6, Math.ceil(distance(target, approach) / 8));
-  for (let i = 1; i < samples; i += 1) {
-    const t = i / samples;
-    const pose = {
-      x: approach.x + (target.x - approach.x) * t,
-      y: approach.y + (target.y - approach.y) * t,
-      theta: scene.target.theta,
-      v: 0,
-      delta: 0
-    };
-    if (isCollision(scene, pose)) {
-      return { ok: false, reason: `${mode} final corridor is blocked` };
+  const corridor = mode === "reverse" ? [approaches[0], approaches[1], target] : [approaches[0], target];
+  for (let segment = 1; segment < corridor.length; segment += 1) {
+    const from = corridor[segment - 1];
+    const to = corridor[segment];
+    const samples = Math.max(6, Math.ceil(distance(from, to) / 8));
+    for (let i = 1; i < samples; i += 1) {
+      const t = i / samples;
+      const pose = {
+        x: from.x + (to.x - from.x) * t,
+        y: from.y + (to.y - from.y) * t,
+        theta: scene.target.theta,
+        v: 0,
+        delta: 0
+      };
+      if (isCollision(scene, pose)) {
+        return { ok: false, reason: `${mode} final corridor is blocked` };
+      }
     }
   }
 
@@ -687,11 +1133,16 @@ function validateTerminalApproach(scene, mode) {
 }
 
 function enforceTerminalWaypoints(route, scene, mode = "forward") {
-  const approach = targetApproachPoint(scene, mode);
+  const farApproach = targetApproachPoint(scene, mode, "far");
+  const approach = targetApproachPoint(scene, mode, "near");
   const target = pointFromState(scene.target);
-  const keepDistance = Math.max(scene.car.length * 1.15, 64);
+  const keepDistance = mode === "reverse"
+    ? Math.max(scene.car.length * 2.55, 138)
+    : Math.max(scene.car.length * 1.15, 64);
   const trimmed = route.filter((point, index) => index === 0 || distance(point, target) > keepDistance);
-  return [...trimmed, approach, target];
+  return mode === "reverse"
+    ? [...trimmed, approach, farApproach, approach, target]
+    : [...trimmed, approach, target];
 }
 
 function buildRouteCandidates(scene) {
@@ -741,7 +1192,7 @@ function buildRouteForMode(scene, mode = "direct") {
   const cols = Math.ceil(scene.width / cell);
   const rows = Math.ceil(scene.height / cell);
   const clearance = Math.hypot(scene.car.length, scene.car.width) * 0.42 + 8;
-  const goalPoint = mode === "direct" ? pointFromState(scene.target) : targetApproachPoint(scene, mode);
+  const goalPoint = mode === "direct" ? pointFromState(scene.target) : targetApproachPoint(scene, mode, "near");
   const blocked = Array.from({ length: rows }, (_, row) =>
     Array.from({ length: cols }, (_, col) => {
       const x = col * cell + cell / 2;
@@ -935,9 +1386,13 @@ function offsetRoute(route, offset) {
   });
 }
 
-function advanceWaypoint(state, waypoints, index, radius) {
+function advanceWaypoint(state, waypoints, index, radius, terminalStart = Infinity, terminalRadius = radius, terminalRadii = null) {
   let next = index;
-  while (next < waypoints.length - 2 && distance(state, waypoints[next]) < radius) {
+  while (next < waypoints.length - 2) {
+    const activeRadius = terminalRadii?.get(next) ?? (next >= terminalStart ? terminalRadius : radius);
+    if (distance(state, waypoints[next]) >= activeRadius) {
+      break;
+    }
     next += 1;
   }
   return next;
